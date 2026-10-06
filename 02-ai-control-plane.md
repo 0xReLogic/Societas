@@ -568,6 +568,11 @@ Deteksi jaringan sepenuhnya menjadi tugas **Go Runtime (Deterministic Enforcer)*
 - Jika HTTP client Go mendeteksi *network drop* atau *timeout* berulang saat menghubungi API model provider, Go Runtime langsung mengeksekusi healthcheck deterministik cepat (socket ping / HEAD request ke DNS publik stabil seperti `1.1.1.1` atau `8.8.8.8`).
 - Tidak ada loop retry buta, tidak ada LLM yang dipanggil untuk mendiagnosa koneksi.
 
+### Pembedaan Network Outage vs Provider Outage
+
+- **Jika ping gagal:** Internet putus total → eksekusi Fail-Closed Auto-Pause (task diubah ke `paused` via CAS pada SQLite).
+- **Jika ping lolos:** Internet hidup, provider sedang down (`MODEL_UNAVAILABLE`) → Model Router langsung mengeksekusi fallback transparan ke provider alternatif (misal: Gemini atau Anthropic) yang terdaftar di konfigurasi tanpa menjeda task. Auto-pause hanya dipicu jika seluruh rantai fallback provider gagal.
+
 ### Fail-Closed Auto-Pause
 
 Jika internet terkonfirmasi putus:

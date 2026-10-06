@@ -48,7 +48,7 @@ urutan onboarding mengikuti peta dokumen di bawah.
 - PROJECT_MAP auto-regen: Doc 03 (§7.1), Doc 09 (§60.4)
 - Provider Rate Limiter (RPM/TPM token bucket): Doc 02 (5A.8)
 - Network Failure Handling (Deterministic Go Runtime): Doc 02 (5A.17)
-- Memory Curation / anti Zombie Memory: Doc 05 (§19.6, §20), Doc 07 (§37.3), Doc 02 (5A.25)
+- Memory Curation / anti Zombie Memory: Doc 05 (§19.6, §20), Doc 07 (§37.3), Doc 02 (5A.26)
 - Review repair: tool outcome/retry (I16, §21, §44, 72A.8–10), pause recovery (72A.6), contract invalidation (§17.1, 72A.6/8), aggregate payload boundary (I5, 72A.12), semantic path guard (§22.2, §59)
 - Approval snapshot SHA-256/JCS + final candidate merge: I17, 72A.8/10/12, §40.2, §60.4; invalidation lewat `approval.invalidated`
 - Semantic Rebase / anti Zombie Memory: Doc 09 (§60.4), Doc 08 (§48.5), Doc 05 (§19.6), Doc 10 (I17, I19, 72A.5, 72A.8)

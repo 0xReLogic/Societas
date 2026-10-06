@@ -1597,7 +1597,7 @@ Menggabungkan kategori di #44 dengan kode di 5A.15. Satu kode punya satu kategor
 | `MAX_DEPTH_EXCEEDED` | `LIMIT_ERROR` | tidak | `task.delegate_rejected`. |
 | `MAX_ITERATIONS_EXCEEDED` | `LIMIT_ERROR` | tidak | Task `failed`. Run dapat berhenti dengan `max_iterations`. |
 | `MODEL_TIMEOUT` | `TIMEOUT` | ya | Retry terbatas, boleh escalate model. |
-| `MODEL_UNAVAILABLE` | `MODEL_ERROR` | ya | Retry terbatas atau fallback ke provider/model lain. |
+| `MODEL_UNAVAILABLE` | `MODEL_ERROR` | ya | Retry terbatas atau fallback ke provider/model lain. Go Runtime melakukan ping ke DNS publik (`1.1.1.1`) untuk membedakan network outage vs provider outage. Jika ping gagal → internet putus total → auto-pause (I21). Jika ping lolos → internet hidup, provider down → Model Router mengeksekusi fallback transparan ke provider alternatif yang terdaftar (misal Gemini, Anthropic) tanpa menjeda task. Auto-pause hanya dipicu jika seluruh rantai fallback provider gagal. |
 | `INVALID_OUTPUT` | `INVALID_OUTPUT` | ya | Agent correction, maksimal 2 kali (I10). |
 | `TOOL_INPUT_INVALID` | `INVALID_OUTPUT` | ya | Agent correction dengan pesan error dari tool schema. |
 | `TOOL_FAILED` | `TOOL_ERROR` | tergantung tool | Retry mengikuti outcome dan capability I16; gagal logis yang diketahui bukan alasan mengulang mutasi secara buta. |
