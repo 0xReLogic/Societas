@@ -48,6 +48,8 @@ Instruksi user diproses berjenjang sebelum task dieksekusi:
 
 **Maintenance `PROJECT_MAP.md` (anti-basi):** file ini **tidak boleh di-update manual** — akan basi dalam hitungan minggu dan Intake mulai salah nebak target modul. `PROJECT_MAP.md` digenerate ulang secara deterministik oleh backend Go (struktur direktori via `tree -d -L 3` + deskripsi singkat per modul) **setiap kali ada task yang berhasil di-merge ke `main`** (lihat #60.4). Generator ini berjalan sebagai task background 0 token — bukan LLM call.
 
+Untuk final-candidate approval (I17, 72A.10), jalankan generator juga **sesudah rebase dan sebelum freeze/gate/review** agar perubahan map ikut tree yang disetujui. Regenerasi otomatis setelah merge harus menghasilkan konten identik/verifikasi; perbedaan tidak boleh diam-diam membuat commit baru ke `main`, melainkan masuk pekerjaan perbaikan dengan gate/review/approval baru. Format sumber deskripsi per modul tetap keputusan terpisah, bukan ditentukan oleh aturan binding ini.
+
 ### 2. Cognitive Router (Jev AI — System 1 Decision Engine)
 
 Berada di dalam Control Plane, menjawab keputusan rute cepat (latensi 70–500ms) dengan format primitif non-chat:

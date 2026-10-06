@@ -161,10 +161,15 @@ Worktree mengisolasi pengerjaan, tapi tidak menyelesaikan merge conflict saat du
 
 - Merge ke `main` diserialkan lewat **satu antrean tunggal di Orchestrator** — tidak ada dua merge bersamaan.
 - Sebelum task diajukan untuk approval, Go **otomatis `git rebase` branch task ke `main` terkini**.
-- Jika rebase bersih → task lanjut ke antrean approval seperti biasa.
+- Jika rebase bersih/konflik selesai → regenerate PROJECT_MAP di kandidat, freeze commit/tree, ulangi compiler/lint/test gate dan Reviewer pada kandidat final, baru request approval dengan snapshot ID/versi/checksum (I17, 72A.8/72A.10). Evidence sebelum rebase tidak berlaku.
 - Jika conflict → Orchestrator **membatalkan pengajuan approval dan mengembalikan task ke Engineer** beserta daftar file conflict (`task.rebase_conflict`), agar Engineer resolve duluan di worktree-nya. Conflict tidak pernah dilempar ke user untuk di-resolve manual.
 
-Payload `task.rebase_conflict` (`conflict_files`, `base_ref`) dan kode `REBASE_CONFLICT` terdaftar di 72A.8/72A.9. Error konflik bukan kegagalan dependency terminal; task tetap nonterminal agar Engineer bisa memperbaikinya. Pengikatan kandidat/gate/approval setelah rebase masih menunggu keputusan W04.
+Payload `task.rebase_conflict` (`conflict_files`, `base_ref`) dan kode `REBASE_CONFLICT` terdaftar di 72A.8/72A.9. Error konflik bukan kegagalan dependency terminal; task tetap nonterminal agar Engineer bisa memperbaikinya.
+
+- Saat menunggu human, task parked dan tidak memegang lock/goroutine antrean. Sebelum integrasi, serial executor re-check input/hash/evidence/policy/contract/expiry dan target base, lalu update target ke **commit yang persis disetujui**, memakai expected-base CAS.
+- Base/kandidat/recipe/policy/contract/evidence berubah → `approval.invalidated`; ulangi rebase → gate → review → approval dengan ID baru. Tidak mewariskan approval lama, meskipun diff serupa.
+- Integrasi fast-forward tidak membuat merge/squash commit baru setelah approval. Working tree/index gate bersih dan cocok candidate tree; target bukan symbolic ref, full ref/OID divalidasi Git.
+- Git-ref CAS tidak menyelesaikan recovery lintas Git+SQLite, sinkronisasi checkout, atau keamanan metadata shared worktree. Keputusan W06/W14 tetap terbuka; jangan memberi agen writable common git-dir untuk memenuhi alur ini.
 
 ---
 

@@ -73,6 +73,8 @@ User dapat:
 
 Approval dapat disimpan sebagai event.
 
+Kontrak wire mengikuti 72A.8/I17: request menunjuk snapshot artifact ID/versi/checksum, grant menggemakan `bound_hash`. Approval tidak lagi valid bila input aktual, policy/contract atau evidence berubah; runtime menerbitkan `approval.invalidated` dan meminta keputusan pada request baru. UI scope tidak mengizinkan bypass hash kandidat final (#40.2/#60.4).
+
 ## 23.1 Risk-Aware Approval
 
 Approval bersifat risk-aware. Evaluasi risiko dilakukan **dinamis** lewat konfigurasi `workspace.yaml` (lihat #36), berdasarkan:
@@ -202,7 +204,7 @@ Engineer tidak otomatis boleh melakukan deployment production.
 
 Output kode Engineer selalu melewati **Deterministic Toolchain Runner** (pipeline build/lint/test lokal, 0 token, fail-fast) sebelum diserahkan ke Reviewer (lihat 5A.21, #29, `toolchain` di #36).
 
-Mekanisme penulisan kode ke worktree memakai **Search & Replace Block** (#60.3) — Engineer tidak menulis ulang seluruh file dan tidak mengarang header unified diff. Sebelum approval, branch task otomatis di-rebase ke `main` oleh Serial Merge Queue (#60.4) — conflict dikembalikan ke Engineer untuk resolve, bukan ke user.
+Mekanisme penulisan kode ke worktree memakai **Search & Replace Block** (#60.3) — Engineer tidak menulis ulang seluruh file dan tidak mengarang header unified diff. Serial Merge Queue (#60.4) melakukan rebase/resolve, freeze kandidat final, lalu **mengulang gate dan Reviewer sebelum approval**. Approval mengikat commit/tree + expected base + recipe/evidence; perubahan kandidat/base membatalkan approval (I17, 72A.8/72A.10). Conflict dikembalikan ke Engineer, bukan user.
 
 Untuk integrasi kontrak/API, Engineer mengikuti alur **Contract-First** (#17.1): codegen binding otomatis + `contract.lookup`, bukan menulis call manual.
 

@@ -56,7 +56,7 @@ class AuditTests(unittest.TestCase):
 
     def test_missing_approval_hash_is_detected(self) -> None:
         report = self.run_fixture(
-            '    "bound_hash": "sha256:9b2e4c7a1f05d38e6c94a2b71e05f38d9a41c6b82e7d3f05a1c9e47b3d8206f5",\n',
+            '    "bound_hash": "sha256:9db02ed91537c1ca63d6d09f9895d669ec210a1cab9859b9362592553510d8a3",\n',
             "",
         )
         self.assert_failed(report, "example:approval.requested")
@@ -70,6 +70,56 @@ class AuditTests(unittest.TestCase):
     def test_unknown_event_example_is_detected(self) -> None:
         report = self.run_fixture('"type": "run.created",', '"type": "run.nonexistent",')
         self.assert_failed(report, "example:run.created")
+
+    def test_missing_snapshot_context_is_detected(self) -> None:
+        report = self.run_fixture(
+            '"workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": null,',
+            '"workspace_id": "ws_acme", "task_id": null,',
+        )
+        self.assert_failed(report, "fixture_schema:approval_budget")
+
+    def test_hash_vector_drift_is_detected(self) -> None:
+        report = self.run_fixture(
+            '"approval_budget": "sha256:9db02ed91537c1ca63d6d09f9895d669ec210a1cab9859b9362592553510d8a3"',
+            '"approval_budget": "sha256:' + "a" * 64 + '"',
+        )
+        self.assert_failed(report, "fixture_digest:approval_budget")
+
+    def test_evidence_candidate_drift_is_detected(self) -> None:
+        report = self.run_fixture(
+            '"candidate_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
+            '"candidate_commit": "ffffffffffffffffffffffffffffffffffffffff"',
+        )
+        self.assert_failed(report, "probe:approval_example_git.merge")
+
+    def test_lost_snapshot_fixture_is_detected(self) -> None:
+        report = self.run_fixture("<!-- fixture:approval_budget -->", "<!-- untagged -->")
+        self.assert_failed(report, "approval_fixtures_present")
+
+    def test_reordered_merge_gate_is_detected(self) -> None:
+        report = self.run_fixture("5. Gate build/lint/test", "5. Skip build/lint/test")
+        self.assert_failed(report, "documented_merge_order")
+
+    def test_cas_without_expected_base_is_detected(self) -> None:
+        report = self.run_fixture(
+            "git update-ref --no-deref <target_ref> <candidate_commit> <expected_base>",
+            "git update-ref --no-deref <target_ref> <candidate_commit>",
+        )
+        self.assert_failed(report, "documented_expected_base_cas")
+
+    def test_duplicate_snapshot_key_is_detected(self) -> None:
+        report = self.run_fixture(
+            '"current_limits": { "max_cost_usd": 1.0 },',
+            '"current_limits": {}, "current_limits": { "max_cost_usd": 1.0 },',
+        )
+        self.assert_failed(report, "parse:")
+
+    def test_relaxed_snapshot_required_fields_are_detected(self) -> None:
+        report = self.run_fixture(
+            '"policy_hash", "contract_hash", "inputs"],',
+            '"policy_hash", "inputs"],',
+        )
+        self.assert_failed(report, "probe:snapshot_approval_budget_missing_contract_hash")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@
 import argparse
 from collections import Counter
 from copy import deepcopy
+from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -20,7 +22,7 @@ import yaml
 
 PREFIX = "urn:societas:1:"
 FENCE = re.compile(r"^```(json|yaml)\s*\n(.*?)^```\s*$", re.M | re.S)
-TAG = re.compile(r"<!-- (schema|schemas|example):([\w.]+) -->\s*$")
+TAG = re.compile(r"<!-- (schema|schemas|example|fixture):([\w.]+) -->\s*$")
 ROW = re.compile(r"^\| `([\w.]+)` \| `(\w+)` \|", re.M)
 NUMBER = re.compile(r"^#{1,6} (\d+[A-Z]?(?:\.\d+)*)\.? ", re.M)
 TASK_EVENTS = {
@@ -94,12 +96,137 @@ def boundary_errors(
             errors.append("resume sender must be orchestrator")
         if not str(event.get("to", "")).startswith("agent:"):
             errors.append("resume must target an agent (owner requires runtime check)")
+    if event_type == "approval.requested":
+        reference = payload.get("snapshot_ref")
+        if isinstance(reference, dict) and reference.get("checksum") != payload.get("bound_hash"):
+            errors.append("snapshot checksum must equal bound_hash")
+    if event_type == "approval.invalidated":
+        if event.get("from") != "system:orchestrator" or event.get("to") != "human:user":
+            errors.append("invalidation sender/target mismatch (not an auth check)")
     try:
         limit = 16000 if event_type == "tool.call_completed" else 8000
         if len(rfc8785.dumps(payload)) > limit:
             errors.append(f"aggregate payload exceeds {limit} UTF-8 bytes")
     except (ValueError, TypeError) as error:
         errors.append(f"payload serialization: {error}")
+    return errors
+
+
+def snapshot_digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(rfc8785.dumps(value)).hexdigest()
+
+
+def approval_errors(
+    request: dict[str, Any],
+    artifacts: dict[tuple[str, int], bytes],
+    schemas: dict[str, dict[str, Any]],
+    registry: Registry,
+    *,
+    current_snapshot: dict[str, Any] | None = None,
+    grant: dict[str, Any] | None = None,
+    status: str = "pending",
+    now: str | None = None,
+    contract_current: bool = True,
+) -> list[str]:
+    """Reference snapshot predicate over fixtures, not an execution/CAS engine."""
+    errors = boundary_errors(request, schemas, {"approval.requested": "approval_requested"}, registry)
+    if errors:
+        return errors
+    payload = request["payload"]
+    reference = payload["snapshot_ref"]
+    content = artifacts.get((reference["artifact_id"], reference["version"]))
+    if content is None:
+        return ["snapshot artifact version unavailable"]
+    try:
+        snapshot = json.loads(content, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        snapshot_errors = list(Draft202012Validator(
+            schemas[PREFIX + "approval_snapshot"], registry=registry,
+            format_checker=FormatChecker(),
+        ).iter_errors(snapshot))
+        if snapshot_errors:
+            return [f"snapshot: {error.message}" for error in snapshot_errors]
+        if content != rfc8785.dumps(snapshot) or snapshot_digest(snapshot) != payload["bound_hash"]:
+            errors.append("snapshot bytes/digest mismatch")
+        if current_snapshot is not None:
+            current_errors = list(Draft202012Validator(
+                schemas[PREFIX + "approval_snapshot"], registry=registry,
+                format_checker=FormatChecker(),
+            ).iter_errors(current_snapshot))
+            if current_errors or snapshot_digest(current_snapshot) != payload["bound_hash"]:
+                errors.append("live bound input changed")
+        for field in ("workspace_id", "run_id", "task_id"):
+            if snapshot[field] != request.get(field):
+                errors.append(f"snapshot envelope mismatch: {field}")
+        if snapshot["action"] != payload["action"]:
+            errors.append("snapshot action mismatch")
+        if status not in {"pending", "granted"}:
+            errors.append("approval no longer valid")
+        if not contract_current:
+            errors.append("task contract stale")
+        if now and payload.get("expires_at"):
+            if datetime.fromisoformat(now.replace("Z", "+00:00")) >= datetime.fromisoformat(
+                payload["expires_at"].replace("Z", "+00:00"),
+            ):
+                errors.append("approval expired")
+        if grant is not None:
+            errors.extend(
+                f"grant: {error.message}" for error in Draft202012Validator(
+                    schemas[PREFIX + "approval_granted"], registry=registry,
+                    format_checker=FormatChecker(),
+                ).iter_errors(grant)
+            )
+            for field in ("approval_id", "bound_hash"):
+                if grant.get(field) != payload[field]:
+                    errors.append(f"grant request mismatch: {field}")
+            if "budget_override" in grant:
+                if snapshot["action"] != "budget.increase" or (
+                    rfc8785.dumps(grant["budget_override"]) !=
+                    rfc8785.dumps(snapshot["inputs"]["proposed_limits"])
+                ):
+                    errors.append("unbound budget override")
+        if snapshot["action"] == "budget.increase":
+            scope = snapshot["inputs"]["scope"]
+            scope_field = {"workspace": "workspace_id", "run": "run_id", "task": "task_id"}.get(scope)
+            if scope_field and snapshot["inputs"]["target_id"] != snapshot[scope_field]:
+                errors.append("budget scope/target identity mismatch")
+        if snapshot["action"] == "tool.execute":
+            resource_ids = [resource["resource_id"] for resource in snapshot["inputs"]["resources"]]
+            if len(set(resource_ids)) != len(resource_ids) or resource_ids != sorted(
+                resource_ids, key=lambda value: value.encode("utf-16-be"),
+            ):
+                errors.append("resource IDs must be unique and sorted by UTF-16 code units")
+        if snapshot["action"] == "git.merge":
+            candidate = snapshot["inputs"]["candidate"]
+            oid_lengths = {len(candidate[field]) for field in ("expected_base", "candidate_commit", "candidate_tree")}
+            if len(oid_lengths) != 1:
+                errors.append("mixed Git object formats")
+            binding = {field: snapshot[field] for field in (
+                "workspace_id", "run_id", "task_id", "policy_hash", "contract_hash",
+            )}
+            binding["candidate"] = candidate
+            for kind, result in (("gate", "pass"), ("review", "approve")):
+                evidence_ref = snapshot["inputs"][kind + "_evidence"]
+                evidence_bytes = artifacts.get((evidence_ref["artifact_id"], evidence_ref["version"]))
+                if evidence_bytes is None:
+                    errors.append(f"{kind} artifact version unavailable")
+                    continue
+                evidence = json.loads(evidence_bytes, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+                evidence_errors = list(Draft202012Validator(
+                    schemas[PREFIX + "merge_evidence"], registry=registry,
+                    format_checker=FormatChecker(),
+                ).iter_errors(evidence))
+                if evidence_errors:
+                    errors.extend(f"{kind}: {error.message}" for error in evidence_errors)
+                    continue
+                checksum = "sha256:" + hashlib.sha256(evidence_bytes).hexdigest()
+                if checksum != evidence_ref["checksum"]:
+                    errors.append(f"{kind} artifact checksum mismatch")
+                if rfc8785.dumps(evidence["binding"]) != rfc8785.dumps(binding):
+                    errors.append(f"{kind} candidate/context mismatch")
+                if evidence["kind"] != kind or evidence["result"] != result:
+                    errors.append(f"{kind} evidence not accepted")
+    except (ValueError, TypeError, UnicodeError) as error:
+        errors.append(f"approval serialization: {error}")
     return errors
 
 
@@ -114,6 +241,7 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
     check("canonical_document_present", bool(canonical))
     schemas: dict[str, dict[str, Any]] = {}
     examples: list[tuple[str, dict[str, Any]]] = []
+    fixtures: dict[str, dict[str, Any]] = {}
     counts: Counter = Counter()
     for filename, text in sorted(texts.items()):
         for match in FENCE.finditer(text):
@@ -133,6 +261,12 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
             if language != "json" or not tag or filename != "10-contracts-mvp-roadmap.md":
                 continue
             kind, name = tag.groups()
+            if kind == "fixture":
+                check(f"fixture_is_object:{name}", isinstance(value, dict))
+                check(f"fixture_unique:{name}", name not in fixtures)
+                if isinstance(value, dict):
+                    fixtures[name] = value
+                continue
             if kind == "example":
                 check(f"example_is_object:{location}", isinstance(value, dict))
                 if isinstance(value, dict):
@@ -210,6 +344,30 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
         probes(schemas, mapping, registry, examples, check)
     else:
         check("probes_runnable", False, "missing schema dependencies or fixture examples")
+    approval_fixtures = {
+        "approval_budget", "approval_merge", "approval_tool",
+        "approval_hash_vectors", "merge_gate", "merge_review",
+    }
+    check("approval_fixtures_present", approval_fixtures <= fixtures.keys())
+    if dependencies_ok and approval_fixtures <= fixtures.keys():
+        try:
+            approval_probes(schemas, registry, examples, fixtures, check)
+        except (ValueError, TypeError, UnicodeError, KeyError) as error:
+            check("approval_probes_runnable", False, str(error))
+    else:
+        check("approval_probes_runnable", False, "missing schema dependencies or approval fixtures")
+    merge_flow = canonical.split("### Serial Merge: Final Candidate Binding")[-1].split("### Output besar")[0]
+    markers = [
+        "2. Rebase branch task", "4. Freeze candidate", "5. Gate build/lint/test",
+        "6. review.requested/completed", "7. Persist snapshot JCS",
+        "8. Tepat sebelum integrasi", "9. Verifikasi candidate_commit",
+    ]
+    positions = [merge_flow.find(marker) for marker in markers]
+    check("documented_merge_order", all(position >= 0 for position in positions) and positions == sorted(positions))
+    conflict = merge_flow.find("conflict -> task.rebase_conflict -> Engineer")
+    approval = merge_flow.find("approval.requested")
+    check("documented_conflict_before_approval", 0 <= conflict < approval)
+    check("documented_expected_base_cas", "git update-ref --no-deref <target_ref> <candidate_commit> <expected_base>" in merge_flow)
 
     state_section = canonical.split("## 72A.6 Task State Machine")[-1].split("## 72A.7")[0]
     transitions = re.findall(
@@ -228,7 +386,7 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
         ("pausing", "failed"), ("pausing", "cancelled"), ("interrupted", "cancelled"),
     }
     check("pause_recovery_transitions", recovery_pairs <= pairs)
-    for error_code in ("SEARCH_BLOCK_NOT_FOUND", "SEARCH_BLOCK_AMBIGUOUS", "REBASE_CONFLICT"):
+    for error_code in ("SEARCH_BLOCK_NOT_FOUND", "SEARCH_BLOCK_AMBIGUOUS", "REBASE_CONFLICT", "APPROVAL_BINDING_INVALID"):
         catalog = canonical.split("## 72A.9")[-1].split("## 72A.10")[0]
         check(f"error_catalog:{error_code}", f"| `{error_code}` |" in catalog)
 
@@ -255,7 +413,7 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
         "audit_kind": "replacement-static-contract-audit",
         "counts": {
             **counts, "schemas": len(schemas), "refs": refs, "registry": len(mapping),
-            "examples": len(examples), "checks": len(checks), "failures": len(failures),
+            "examples": len(examples), "fixtures": len(fixtures), "checks": len(checks), "failures": len(failures),
         },
         "passed": not failures,
         "checks": checks,
@@ -263,6 +421,8 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
             "Original review audit assets were not supplied; counts/probes may differ.",
             "YAML syntax only; no workspace config schema was supplied.",
             "Reference boundary probes are not runtime integration tests.",
+            "Approval fixture predicates/document-order checks do not execute rebase, gates, "
+            "review, Git-ref CAS, scope consumption, or live resource-version checks.",
             "No authentication, ownership, SQLite CAS/outbox/ledger, crash injection, "
             "provider/tool reconciliation, memory GC, Git broker, or OS sandbox tested.",
             "Audit pass does not close pending design findings or prove MVP acceptance.",
@@ -339,6 +499,175 @@ def probes(schemas: dict, mapping: dict, registry: Registry, examples: list, che
     )
     event_probe("aggregate_short_strings", "tool.call_completed", {**completed, "output": {"a": "x" * 9000, "b": "x" * 9000}}, False)
     event_probe("multibyte_output", "tool.call_completed", {**completed, "output": "界" * 6000}, False)
+
+
+def approval_probes(
+    schemas: dict, registry: Registry, examples: list,
+    fixtures: dict[str, dict[str, Any]], check: Any,
+) -> None:
+    valid_fixtures = True
+    vector_names = {"approval_budget", "approval_merge", "approval_tool", "merge_gate", "merge_review"}
+    check("fixture_hash_vectors_complete", fixtures["approval_hash_vectors"].keys() == vector_names)
+    for name in sorted(vector_names):
+        schema_name = "approval_snapshot" if name.startswith("approval_") else "merge_evidence"
+        valid = Draft202012Validator(
+            schemas[PREFIX + schema_name], registry=registry,
+            format_checker=FormatChecker(),
+        ).is_valid(fixtures[name])
+        check(f"fixture_schema:{name}", valid)
+        check(f"fixture_digest:{name}", snapshot_digest(fixtures[name]) == fixtures["approval_hash_vectors"].get(name))
+        valid_fixtures = valid_fixtures and valid
+    if not valid_fixtures:
+        check("approval_profiles_runnable", False, "invalid snapshot/evidence fixture")
+        return
+    snapshot_validator = Draft202012Validator(
+        schemas[PREFIX + "approval_snapshot"], registry=registry, format_checker=FormatChecker(),
+    )
+    for name in ("approval_budget", "approval_merge", "approval_tool"):
+        snapshot = fixtures[name]
+        for field in snapshot:
+            missing = {key: value for key, value in snapshot.items() if key != field}
+            check(f"probe:snapshot_{name}_missing_{field}", not snapshot_validator.is_valid(missing))
+        check(f"probe:snapshot_{name}_extra_field", not snapshot_validator.is_valid({**snapshot, "unexpected": True}))
+        for field in snapshot["inputs"]:
+            missing = {**snapshot, "inputs": {key: value for key, value in snapshot["inputs"].items() if key != field}}
+            check(f"probe:snapshot_{name}_missing_input_{field}", not snapshot_validator.is_valid(missing))
+    unknown_profile = {**fixtures["approval_merge"], "action": "unregistered.action"}
+    check("probe:snapshot_unknown_profile", not snapshot_validator.is_valid(unknown_profile))
+    requests = {
+        event["payload"]["action"]: event
+        for name, event in examples if name == "approval.requested"
+    }
+    grants = [event["payload"] for name, event in examples if name == "approval.granted"]
+    check("approval_examples_present", {"budget.increase", "git.merge"} <= requests.keys() and bool(grants))
+    if not {"budget.increase", "git.merge"} <= requests.keys() or not grants:
+        return
+    artifacts: dict[tuple[str, int], bytes] = {}
+    for action, name in (("budget.increase", "approval_budget"), ("git.merge", "approval_merge")):
+        reference = requests[action]["payload"]["snapshot_ref"]
+        artifacts[(reference["artifact_id"], reference["version"])] = rfc8785.dumps(fixtures[name])
+    merge = fixtures["approval_merge"]
+    for kind in ("gate", "review"):
+        reference = merge["inputs"][kind + "_evidence"]
+        artifacts[(reference["artifact_id"], reference["version"])] = rfc8785.dumps(fixtures["merge_" + kind])
+
+    def request_for(snapshot: dict, template: dict, artifact_id: str) -> dict:
+        request = deepcopy(template)
+        for field in ("workspace_id", "run_id", "task_id"):
+            if snapshot[field] is None:
+                request.pop(field, None)
+            else:
+                request[field] = snapshot[field]
+        bound_hash = snapshot_digest(snapshot)
+        request["payload"].update({
+            "action": snapshot["action"], "bound_hash": bound_hash,
+            "snapshot_ref": {"artifact_id": artifact_id, "version": 1, "checksum": bound_hash},
+            "reason": "Reference fixture request for " + snapshot["action"],
+        })
+        return request
+
+    def probe(name: str, accepted: bool, request: dict | None = None, **fields: Any) -> None:
+        errors = approval_errors(request or requests["git.merge"], artifacts, schemas, registry, **fields)
+        check(f"probe:approval_{name}", (not errors) == accepted, {"expected_accept": accepted, "errors": errors})
+
+    for action, request in requests.items():
+        probe("example_" + action, True, request)
+    tool = fixtures["approval_tool"]
+    tool_request = request_for(tool, requests["git.merge"], "art_01J9ZB6W9B4V3CGZKBZ01PDVKT")
+    artifacts[("art_01J9ZB6W9B4V3CGZKBZ01PDVKT", 1)] = rfc8785.dumps(tool)
+    probe("tool_snapshot", True, tool_request)
+    probe("valid_grant", True, grant=grants[0], status="granted", now="2026-10-06T10:29:59Z")
+    probe("expired_at_boundary", False, grant=grants[0], now="2026-10-06T10:30:00Z")
+    for state in ("invalidated", "rejected", "expired"):
+        probe("late_grant_" + state, False, grant=grants[0], status=state)
+    probe("contract_stale", False, grant=grants[0], contract_current=False)
+    probe("wrong_grant_hash", False, grant={**grants[0], "bound_hash": "sha256:" + "a" * 64})
+    probe("wrong_grant_id", False, grant={**grants[0], "approval_id": "apr_01J9ZB6W9B4V3CGZKBZ01PDVKL"})
+    probe("merge_budget_override", False, grant={**grants[0], "budget_override": {"max_cost_usd": 1.3}})
+    budget_grant = {**grants[0], **{
+        field: requests["budget.increase"]["payload"][field] for field in ("approval_id", "bound_hash")
+    }}
+    probe("budget_grant", True, requests["budget.increase"], grant=budget_grant)
+    probe("budget_matching_override", True, requests["budget.increase"], grant={
+        **budget_grant, "budget_override": {"max_cost_usd": 1.3},
+    })
+    probe("budget_changed_override", False, requests["budget.increase"], grant={
+        **budget_grant, "budget_override": {"max_cost_usd": 2.0},
+    })
+    for field in ("workspace_id", "run_id", "task_id"):
+        changed_request = deepcopy(requests["git.merge"])
+        changed_request[field] = {"workspace_id": "ws_other", "run_id": "RUN-002", "task_id": "TASK-002"}[field]
+        probe("wrong_" + field, False, changed_request)
+    changed_request = deepcopy(requests["git.merge"])
+    changed_request["payload"]["snapshot_ref"]["version"] = 2
+    probe("snapshot_wrong_version", False, changed_request)
+    changed_request = deepcopy(requests["git.merge"])
+    changed_request["payload"]["snapshot_ref"]["checksum"] = "sha256:" + "a" * 64
+    probe("snapshot_wrong_checksum", False, changed_request)
+    changed_request["payload"]["bound_hash"] = "sha256:" + "a" * 64
+    probe("prefixed_git_oid_is_not_snapshot_hash", False, changed_request)
+    check("probe:approval_missing_artifact", bool(approval_errors(
+        requests["git.merge"], {}, schemas, registry,
+    )))
+    for field in ("expected_base", "candidate_commit", "candidate_tree", "gate_recipe_hash"):
+        changed = deepcopy(merge)
+        changed["inputs"]["candidate"][field] = ("sha256:" if field == "gate_recipe_hash" else "") + "f" * (
+            64 if field == "gate_recipe_hash" else 40
+        )
+        probe("changed_" + field, False, grant=grants[0], current_snapshot=changed)
+    for field in ("policy_hash", "contract_hash"):
+        probe("changed_" + field, False, grant=grants[0], current_snapshot={**merge, field: "sha256:" + "f" * 64})
+    changed = deepcopy(merge)
+    changed["inputs"]["candidate"]["expected_base"] = changed["inputs"]["candidate"]["candidate_commit"]
+    probe("base_moved_before_cas", False, grant={**grants[0], "scope": "run"}, current_snapshot=changed)
+    changed_tool = deepcopy(tool)
+    changed_tool["inputs"]["arguments"]["label"] = "changed"
+    probe("changed_tool_arguments", False, tool_request, current_snapshot=changed_tool)
+    changed_tool = deepcopy(tool)
+    changed_tool["inputs"]["resources"][0]["version"] = "sha256:" + "f" * 64
+    probe("changed_resource_version", False, tool_request, current_snapshot=changed_tool)
+    check("probe:approval_jcs_key_order", snapshot_digest(dict(reversed(list(merge.items())))) == snapshot_digest(merge))
+    check("probe:approval_unicode_not_normalized", snapshot_digest({"label": "é"}) != snapshot_digest({"label": "e\u0301"}))
+    check("probe:approval_utf8_vector", "界".encode() in artifacts[("art_01J9ZB6W9B4V3CGZKBZ01PDVKT", 1)])
+    for resource_ids, accepted in (
+        (["\U00010000", "\uffff"], True), (["\uffff", "\U00010000"], False), (["same", "same"], False),
+    ):
+        changed_tool = deepcopy(tool)
+        changed_tool["inputs"]["resources"] = [
+            {"resource_id": value, "version": str(index)} for index, value in enumerate(resource_ids)
+        ]
+        changed_request = request_for(changed_tool, tool_request, "art_01J9ZB6W9B4V3CGZKBZ01PDVKT")
+        errors = approval_errors(changed_request, {
+            ("art_01J9ZB6W9B4V3CGZKBZ01PDVKT", 1): rfc8785.dumps(changed_tool),
+        }, schemas, registry)
+        check(f"probe:approval_resource_order:{repr(resource_ids)}", (not errors) == accepted, errors)
+    for value in (float("nan"), float("inf"), 2**64, "\ud800"):
+        try:
+            snapshot_digest({"invalid": value})
+            rejected = False
+        except (ValueError, TypeError, UnicodeError):
+            rejected = True
+        check(f"probe:approval_unsafe_value:{repr(value)}", rejected)
+    for kind, result in (("gate", "fail"), ("review", "request_changes")):
+        for mutation in ("result", "candidate", "contract_hash"):
+            bad_evidence = deepcopy(fixtures["merge_" + kind])
+            if mutation == "result":
+                bad_evidence["result"] = result
+            elif mutation == "candidate":
+                bad_evidence["binding"]["candidate"]["candidate_commit"] = "f" * 40
+            else:
+                bad_evidence["binding"]["contract_hash"] = "sha256:" + "f" * 64
+            changed = deepcopy(merge)
+            reference = changed["inputs"][kind + "_evidence"]
+            reference["checksum"] = snapshot_digest(bad_evidence)
+            changed_request = request_for(changed, requests["git.merge"], "art_01J9ZB6W9B4V3CGZKBZ01PDVKR")
+            changed_artifacts = {
+                **artifacts,
+                ("art_01J9ZB6W9B4V3CGZKBZ01PDVKR", 1): rfc8785.dumps(changed),
+                (reference["artifact_id"], reference["version"]): rfc8785.dumps(bad_evidence),
+            }
+            errors = approval_errors(changed_request, changed_artifacts, schemas, registry)
+            check(f"probe:approval_rehashed_{kind}_{mutation}", bool(errors), errors)
 
 
 def main() -> int:
