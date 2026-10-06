@@ -90,7 +90,7 @@ Budget harus enforced oleh runtime.
 
 Agent tidak boleh menaikkan budget dirinya sendiri.
 
-`max_rebuttals` membatasi putaran sanggahan per task. Saat limit tercapai tanpa kesepakatan, Orchestrator membekukan task dan dieskalasi ke `escalation_lead` (konfigurasi #36, contoh: CTO) untuk `decision.md` (lihat #48).
+`max_rebuttals` membatasi putaran sanggahan per task dan merupakan field Budget kanonik (72A.5). Counter disimpan di SQLite, tidak reset saat retry/restart. Saat limit tercapai tanpa kesepakatan, Orchestrator membekukan task dan dieskalasi ke `escalation_lead` (konfigurasi #36, contoh: CTO) untuk `decision.md` (lihat #48).
 
 **Reservation lease/TTL:** setiap `budget.reserved` membawa lease dengan TTL. Jika sistem mati sebelum `budget.settled`, sisa reservasi otomatis **expired** dan di-reconcile saat startup — mencegah orphan reservation yang menahan budget selamanya.
 
@@ -430,6 +430,8 @@ retry:
 ```
 
 Jangan menggunakan unlimited retry.
+
+Untuk tool, timeout/network error tidak membuktikan side effect belum terjadi. Orchestrator memeriksa `outcome` dan capability tepercaya (#21) sebelum retry: `outcome_unknown` hanya aman untuk retry otomatis bila idempotent atau provider menegakkan `operation_key` stabil sejak dispatch pertama. Tanpa itu, wajib rekonsiliasi/keputusan human (72A.1 I16, 72A.8–10), walaupun retry budget masih tersedia.
 
 ## 5A.14 Fan-Out Limit
 

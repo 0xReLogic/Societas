@@ -25,7 +25,7 @@ test-report.md
 
 Agen dilarang menulis fungsi fetch/call Web3 atau API dari nol secara manual. Alur serah terima backend/smart contract ke frontend:
 
-1. **Pinning Kontrak:** task frontend wajib mengunci `contract_hash` (SHA256 dari OpenAPI spec / Contract ABI). Jika spec berubah, task ditandai **stale**.
+1. **Pinning Kontrak:** task frontend wajib mengunci `contract_hash` (SHA256 dari OpenAPI spec / Contract ABI). Jika spec berubah, Orchestrator menerbitkan `task.contract_changed` (`phase: invalidated`) dan menetapkan `contract_status: stale` — freshness terpisah dari status eksekusi. Dispatch/resume, review, approval, dan completion ditahan sampai re-pin + codegen terhadap spec terbaru; gate/review/approval lama tidak valid. Re-pin sukses direkam sebagai `phase: repinned`; task terminal tidak dibuka kembali. Lifecycle kanonik di 72A.6/72A.8.
 2. **Codegen Otomatis:** Go runtime men-generate client TypeScript/Rust binding via CLI tool (`orval`, `wagmi` typegen, `viem`) sebelum agen bekerja.
 3. **Strict Usage:** agen hanya boleh mengimpor dan memanggil fungsi hasil generate tersebut.
 4. **Token-Saver Lookup:** agen tidak menerima seluruh spec OpenAPI/ABI ke prompt. Disediakan tool deterministik `contract.lookup(operation_id)` yang mengembalikan potongan spec relevan saja — tanpa vector search.
@@ -201,6 +201,20 @@ kubernetes
 ```
 
 Tool access harus configurable per agent.
+
+Capability retry setiap tool disimpan dalam konfigurasi tepercaya Tool Runtime, bukan ditentukan oleh agen atau sekadar keberadaan field di input:
+
+```yaml
+tool_capabilities:
+  filesystem.read:
+    idempotent: true
+    operation_key_enforced: false
+  external.mutate:
+    idempotent: false
+    operation_key_enforced: false  # true hanya jika penyedia menjamin deduplikasi
+```
+
+Field yang tidak diisi berarti `false`. Untuk tool non-idempotent dengan `operation_key_enforced: true`, runtime membuat dan menyimpan `operation_key` sebelum dispatch pertama, mempertahankannya beserta argumen yang sama untuk seluruh retry, dan hanya retry selama jaminan deduplikasi penyedia masih berlaku. Tidak menambahkan field ini ke argumen MCP bila provider tidak mendukungnya. Timeout/network putus sesudah dispatch berarti `outcome_unknown`, bukan bukti tool belum berjalan. Tanpa jaminan idempotency/deduplikasi, rekonsiliasi atau keputusan human yang menyebut risiko duplikasi wajib mendahului percobaan lain (I16, 72A.8–10). Tool dengan hasil gagal logis memakai `tool.call_completed` `status: error`; tool pasti belum dispatch memakai `tool.call_failed` `outcome: not_started`.
 
 ## 21.1 Tool Interface — MCP Client
 

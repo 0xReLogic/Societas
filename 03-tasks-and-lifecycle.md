@@ -56,6 +56,8 @@ Berada di dalam Control Plane, menjawab keputusan rute cepat (latensi 70–500ms
 - `Choice` -> model tier worker (`cheap` | `medium` | `thinking`)
 - `Score` / `Choice` -> skor evaluasi risiko task
 
+`thinking` adalah label tampilan, dipetakan adapter menjadi wire tier `strong`. Nilai kanonik yang dipersist/dikirim tetap `cheap | medium | strong` (72A.4); jangan mengirim literal `thinking`.
+
 ### 3. Control Plane / Go Runtime (Deterministic Enforcer)
 
 Menjalankan state machine (72A.6), menghitung budget saldo token, mengunci sandbox disk OS (Path Jailing #22.2), dan memproses event tombol UI (#33.3) — semua tanpa token LLM.

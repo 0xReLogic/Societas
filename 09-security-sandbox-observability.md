@@ -52,10 +52,12 @@ shell:
 
   # Path Jailing: eksekusi terkunci mutlak di ./workspace
   cwd_jail: "./workspace"
-  reject_args_containing:
-    - "../"      # path traversal
-    - "/"        # direktori absolut (/, /etc, ...)
-    - "~"        # path home
+  path_validation:
+    mode: semantic  # klasifikasikan argumen sesuai adapter subcommand
+    allow_relative_within_jail: true
+    reject_absolute: true
+    reject_escape: true
+    reject_home_expansion: true
 
   # Mutasi direktori berskala besar -> human approval (#22.3, #23)
   require_approval:
@@ -63,6 +65,8 @@ shell:
 ```
 
 Pelanggaran guard ditolak secara deterministik oleh Policy Engine dan dicatat sebagai event penolakan.
+
+Guard memvalidasi argumen path, termasuk nilai flag path (`--output=...`), menurut adapter binary/subcommand. Normalisasi path terhadap `cwd_jail`, tolak path absolut/home expansion dan hasil resolusi yang keluar jail; **jangan menolak slash secara substring**. `src/main.go` dan pola paket `go test ./...` sah; `@scope/pkg` adalah identifier paket, bukan path absolut. Bentuk path sesuai OS (termasuk drive/UNC pada Windows) harus ditangani adapter. Argumen yang tidak dapat diklasifikasikan dengan aman ditolak (default-deny), tidak diasumsikan non-path. OS isolation #59.1 tetap wajib untuk symlink/TOCTOU dan kode build arbitrary.
 
 ## 59.1 OS-Level Isolation (Requirement Utama)
 
@@ -148,6 +152,7 @@ pub enum NullifierStatus {
 
 - Tool Runtime (Go) mencari blok `SEARCH` secara literal di file target di dalam worktree, lalu menggantinya dengan blok `REPLACE` secara presisi — nomor baris tidak pernah dihitung LLM.
 - Jika blok tidak ketemu persis (whitespace/konteks berubah), tool mengembalikan error deterministik `SEARCH_BLOCK_NOT_FOUND` dan agen wajib membaca ulang file asli — **bukan** retry buta.
+- Jika ada lebih dari satu kecocokan literal, tool mengembalikan `SEARCH_BLOCK_AMBIGUOUS` tanpa menerapkan edit; agen memperlebar konteks SEARCH. Kedua kode terdaftar di 72A.9.
 - Hasil akhir tetap diproduksi sebagai artifact `patch.diff` (#17) dari `git diff` di worktree — LLM tidak pernah men-generate header diff sendiri.
 
 ## 60.4 Serial Merge Queue (Rebase-before-Approval)
@@ -158,6 +163,8 @@ Worktree mengisolasi pengerjaan, tapi tidak menyelesaikan merge conflict saat du
 - Sebelum task diajukan untuk approval, Go **otomatis `git rebase` branch task ke `main` terkini**.
 - Jika rebase bersih → task lanjut ke antrean approval seperti biasa.
 - Jika conflict → Orchestrator **membatalkan pengajuan approval dan mengembalikan task ke Engineer** beserta daftar file conflict (`task.rebase_conflict`), agar Engineer resolve duluan di worktree-nya. Conflict tidak pernah dilempar ke user untuk di-resolve manual.
+
+Payload `task.rebase_conflict` (`conflict_files`, `base_ref`) dan kode `REBASE_CONFLICT` terdaftar di 72A.8/72A.9. Error konflik bukan kegagalan dependency terminal; task tetap nonterminal agar Engineer bisa memperbaikinya. Pengikatan kandidat/gate/approval setelah rebase masih menunggu keputusan W04.
 
 ---
 
@@ -217,6 +224,8 @@ Result:
 ```
 
 Contoh di atas disederhanakan. Schema lengkap (`tool_call_id`, `output_artifact_id`, `error`, batas output inline) ada di **Section 72A.8**, dan alur baku tool call di **72A.10**.
+
+`tool.call_failed` wajib membawa `outcome: not_started | outcome_unknown`; timeout setelah dispatch tidak boleh dilabeli not_started. Batas inline berlaku untuk seluruh payload terserialisasi, termasuk nested object dan byte UTF-8, bukan hanya `maxLength` string (I5, 72A.12).
 
 ---
 

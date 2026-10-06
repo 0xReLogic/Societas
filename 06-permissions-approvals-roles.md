@@ -34,11 +34,13 @@ permissions:
 
 ## 22.2 Path Jailing
 
-Eksekusi proses dikunci ke `Current Working Directory` (`./workspace` atau worktree task, #60.1). Policy Engine menolak secara deterministik semua argumen yang mengandung:
+Eksekusi proses dikunci ke `Current Working Directory` (`./workspace` atau worktree task, #60.1). Adapter binary/subcommand membedakan path, pola paket, identifier, dan nilai flag. Untuk argumen path, Policy Engine menolak:
 
-- path traversal (`../`)
+- path traversal yang setelah normalisasi/resolusi keluar jail
 - direktori absolut (`/`, `/etc`, ...)
 - path home (`~`)
+
+Slash relatif bukan pelanggaran: `src/main.go`, pola paket `./...`, dan identifier paket `@scope/pkg` boleh diterima menurut adapter. Nilai flag path juga diperiksa; bentuk absolut mengikuti OS, termasuk drive/UNC. Argumen ambigu ditolak secara default, bukan dilewatkan. Contoh konfigurasi semantic guard ada di #59.
 
 Penting: **string filtering BUKAN sandboxing yang aman.** Binary allowlist seperti `go build`, `npm`, atau `cargo` dapat mengeksekusi kode arbitrary (build scripts, codegen, post-install) dan argumen path rentan symlink escape. Path jailing hanya lapis pertama — eksekusi build/test/shell **wajib** berjalan di dalam OS-level isolation (#59.1).
 
@@ -231,6 +233,8 @@ PASS_WITH_WARNINGS
 REQUEST_CHANGES
 BLOCKED
 ```
+
+Label tampilan yang ekuivalen dipetakan ke wire `review.completed.verdict` (72A.8): `PASS` → `approve`, `PASS_WITH_WARNINGS` → `approve` dengan temuan advisory nonblocking, `REQUEST_CHANGES` → `request_changes`. `reject` adalah penolakan final hasil review, bukan state task `blocked`. Label legacy `BLOCKED` tidak boleh otomatis diubah menjadi `reject` atau mengubah state task; maknanya masih menunggu keputusan I01 (penolakan final vs menunggu dependency/policy). Adapter wajib menghasilkan verdict kanonik yang eksplisit sebelum hasil review diproses.
 
 Reviewer LLM **hanya dipanggil setelah Local Compiler Gate lolos** (5A.21): backend Go menjalankan build/linter lokal terlebih dahulu dengan biaya 0 token; kegagalan sintaks dikembalikan langsung ke Engineer tanpa memanggil Reviewer.
 

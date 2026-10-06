@@ -1,0 +1,6 @@
+.venv-audit/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+/validation-results.json
