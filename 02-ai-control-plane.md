@@ -318,6 +318,17 @@ Jev AI dan Model Router hanya boleh merutekan ke **ID agen yang aktif terdaftar*
 
 Risk-aware routing: jika task memiliki `risk_tier: critical` (lihat #23.1, 72A.5), Model Router **otomatis menaikkan pengerjaan ke model tier tinggi (thinking mode)** dan menyuntikkan audit keamanan wajib — terlepas dari skor confidence. Eksekusi mutasi task tersebut tetap terkunci hingga disetujui manusia.
 
+### Provider Rate Limiter (Token Bucket per API Key)
+
+Budget Manager menghitung biaya ($/token), tapi biaya bukan satu-satunya batas: provider juga memberlakukan **RPM (requests/menit) dan TPM (token/menit)** per API key. Saat 2–3 agen berjalan paralel dan menembak model tier tinggi bersamaan, request bisa langsung kena `HTTP 429: Too Many Requests`. Retry buta tanpa antrean justru menumpuk request dan menghabiskan retry budget (5A.13) sia-sia.
+
+Karena itu Model Router memasang **`rate.Limiter` (token bucket) global per API key provider** di dalam Go runtime — bukan di sisi agen:
+
+- Setiap model call harus mengambil token dari bucket RPM dan TPM provider terkait sebelum keluar ke jaringan.
+- Jika bucket habis, request agen **mengantre di RAM Go** (bounded queue, 0 token) sampai slot tersedia — bukan langsung jedor ke provider.
+- `429` yang tetap terjadi (limit berubah, burst tak terduga) diperlakukan sebagai sinyal backpressure: Go mengecilkan rate bucket sementara lalu memulihkannya bertahap, bukan memicu retry storm.
+- Antrean ini konsisten dengan backpressure Event Bus (#42) dan mailbox per subscriber (#42.2).
+
 ## 5A.9 Model Escalation
 
 Agent tidak harus langsung memakai model paling kuat.

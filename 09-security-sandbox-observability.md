@@ -124,6 +124,41 @@ Path Jailing (#22.2) tetap berlaku — jail scope diarahkan ke worktree task, bu
 - **Git subcommand restrictions:** agen dilarang menjalankan destructive command di luar worktree miliknya (mis. `branch -D`, `reset --hard` pada repo utama) — allowlist subcommand git divalidasi Policy Engine per worktree scope.
 - **Shared dependency cache:** dependency manager memakai cache global (pnpm store, Go mod cache) agar disk tidak membengkak karena `node_modules`/deps di tiap worktree.
 
+## 60.3 Edit Mechanism — Search & Replace Block
+
+Engineer **tidak menulis ulang seluruh file** (boros token output, latensi tinggi, rawan lazy output `// rest of code...`) dan **tidak mengeluarkan unified diff mentah** (`patch.diff` standar dengan header `@@ -42,7 +42,9 @@` — LLM tidak presisi menghitung nomor baris sehingga `git apply` sering reject).
+
+Mekanisme baku penulisan ke disk worktree memakai tool **Search & Replace Block** (pola Aider / Claude Code):
+
+```text
+<<<<<<< SEARCH
+pub enum NullifierStatus {
+    Reserved,
+    Confirmed,
+}
+=======
+pub enum NullifierStatus {
+    Reserved,
+    Submitted,
+    Confirmed,
+    Released,
+}
+>>>>>>> REPLACE
+```
+
+- Tool Runtime (Go) mencari blok `SEARCH` secara literal di file target di dalam worktree, lalu menggantinya dengan blok `REPLACE` secara presisi — nomor baris tidak pernah dihitung LLM.
+- Jika blok tidak ketemu persis (whitespace/konteks berubah), tool mengembalikan error deterministik `SEARCH_BLOCK_NOT_FOUND` dan agen wajib membaca ulang file asli — **bukan** retry buta.
+- Hasil akhir tetap diproduksi sebagai artifact `patch.diff` (#17) dari `git diff` di worktree — LLM tidak pernah men-generate header diff sendiri.
+
+## 60.4 Serial Merge Queue (Rebase-before-Approval)
+
+Worktree mengisolasi pengerjaan, tapi tidak menyelesaikan merge conflict saat dua task paralel menyentuh file yang sama (mis. `crates/storage/mod.rs`, `Cargo.toml`). Aturannya:
+
+- Merge ke `main` diserialkan lewat **satu antrean tunggal di Orchestrator** — tidak ada dua merge bersamaan.
+- Sebelum task diajukan untuk approval, Go **otomatis `git rebase` branch task ke `main` terkini**.
+- Jika rebase bersih → task lanjut ke antrean approval seperti biasa.
+- Jika conflict → Orchestrator **membatalkan pengajuan approval dan mengembalikan task ke Engineer** beserta daftar file conflict (`task.rebase_conflict`), agar Engineer resolve duluan di worktree-nya. Conflict tidak pernah dilempar ke user untuk di-resolve manual.
+
 ---
 
 # 61. Research Integration

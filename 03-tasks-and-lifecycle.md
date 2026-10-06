@@ -46,6 +46,8 @@ Instruksi user diproses berjenjang sebelum task dieksekusi:
 - Menghasilkan brief task terstruktur: `goal`, `target_modules`, `risk_hint`.
 - Fleksibel: jika folder/fitur belum terpetakan, fallback otomatis ke `target_path: null` dan `risk_hint: "normal"`.
 
+**Maintenance `PROJECT_MAP.md` (anti-basi):** file ini **tidak boleh di-update manual** — akan basi dalam hitungan minggu dan Intake mulai salah nebak target modul. `PROJECT_MAP.md` digenerate ulang secara deterministik oleh backend Go (struktur direktori via `tree -d -L 3` + deskripsi singkat per modul) **setiap kali ada task yang berhasil di-merge ke `main`** (lihat #60.4). Generator ini berjalan sebagai task background 0 token — bukan LLM call.
+
 ### 2. Cognitive Router (Jev AI — System 1 Decision Engine)
 
 Berada di dalam Control Plane, menjawab keputusan rute cepat (latensi 70–500ms) dengan format primitif non-chat:

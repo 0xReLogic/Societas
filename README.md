@@ -41,3 +41,6 @@ jadi referensi silang (`#48`, `5A.8`, `72A.5`, `I3`, dst) tetap valid antar-doku
 - Contract-First (codegen, contract.lookup): Doc 05 (§17.1), Doc 10 (72A.5 `contract_hash`)
 - OpenRouter Usage Accounting: Doc 06 (§32.1), Doc 02 (5A.10, 5A.25)
 - Dynamic Enum Injection & Blind Delegation: Doc 02 (5A.8), Doc 06 (§30.1), Doc 10 (72A.8, 72A.10)
+- Search & Replace Edit + Serial Merge Queue: Doc 09 (§60.3–60.4), Doc 06 (§28), Doc 08 (§45)
+- PROJECT_MAP auto-regen: Doc 03 (§7.1), Doc 09 (§60.4)
+- Provider Rate Limiter (RPM/TPM token bucket): Doc 02 (5A.8)
