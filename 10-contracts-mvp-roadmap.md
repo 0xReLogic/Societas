@@ -347,6 +347,13 @@ Yang dikirim antar-agent adalah referensi, bukan isi (5A.6). Memperluas #17.
     "task_id": { "$ref": "urn:societas:1:common#/$defs/task_id" },
     "created_by": { "$ref": "urn:societas:1:common#/$defs/actor" },
     "created_at": { "$ref": "urn:societas:1:common#/$defs/ts" },
+    "superseded_by": { "$ref": "urn:societas:1:common#/$defs/art_id",
+                     "description": "opsional — tombstone #19.6; artifact basi, tidak boleh masuk context" },
+    "staleness": { "type": "string", "enum": ["fresh", "stale"], "default": "fresh",
+                   "description": "stale jika source_path/commit sudah tidak ada di main (#19.6)" },
+    "source_path": { "type": "string", "maxLength": 1024,
+                     "description": "path file repo sumber memori (#19.6)" },
+    "source_commit": { "type": "string", "maxLength": 64 },
     "metadata": { "type": "object" }
   }
 }

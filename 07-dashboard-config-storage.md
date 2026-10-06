@@ -262,5 +262,6 @@ Implementasi: embedded vector DB seperti **ChromaDB** atau **`sqlite-vec`**, aga
 - Semantic Retrieval (5A.24) menanyakan Vector DB dan menerima ID referensi artifact/memory.
 - SQLite tidak pernah dipakai untuk pencarian teks mentah atau `LIKE`.
 - Vector DB tidak pernah dipakai untuk relasi data, status, atau ledger — itu tanggung jawab SQLite.
+- ID hasil retrieval Vector DB **wajib di-validasi ulang ke SQLite** sebelum masuk context: yang `superseded` atau `stale` dibuang (#19.6 Memory Curation).
 
 ---
