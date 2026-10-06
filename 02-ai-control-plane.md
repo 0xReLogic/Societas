@@ -197,6 +197,27 @@ Struktur ini mengunci mekanisme atensi model agar:
 - Model memperlakukan anti-pattern sebagai constraint, bukan contoh implementasi yang harus ditiru
 - Anti-pattern ditandai dengan metadata `cognitive_guardrail: true` dan tag `anti-pattern` di Vector DB (#19.6)
 
+### Prompt Caching Optimization (Session Policy)
+
+Saat `session_policy.mode: sticky_until_done` (default), Context Manager menyusun hierarki prompt dari statis ke dinamis untuk memaksimalkan Prompt Cache Hit Rate provider:
+
+```text
+1. System Prompt & Role (statis per agent) → cache hit rate tinggi
+2. Tool Schemas (statis per workspace) → cache hit rate tinggi
+3. PROJECT_MAP.md (statis per workspace) → cache hit rate tinggi
+4. Recent History (dinamis per turn) → cache hit rate rendah
+5. Input Baru (dinamis per turn) → cache miss (selalu direfresh)
+```
+
+Konsumsi token per turn ditangkap secara real-time via metrik `cached_input_tokens` di payload response (72A.5 `usage`). Sesi provider/thread RAM dipertahankan hidup selama task berjalan aktif (`running`) agar agen tidak kehilangan alur pemikiran saat bolak-balik eksekusi tool.
+
+Sesi wajib di-flush dan ditutup jika:
+- Task mencapai status terminal (`completed`, `failed`, `cancelled`).
+- Task masuk kondisi parkir atau jeda lama (`awaiting_approval`, `paused`, `interrupted`, `blocked`) — ringkasan dan checkpoint dipersist ke SQLite, worker dilepas (#40.1).
+- Turn mencapai `max_turns_before_flush` (konfigurasi workspace #36) — ringkasan otomatis dibuat via Summarizer, disimpan ke SQLite, lalu sesi di-reset untuk mencegah context rot dan lonjakan biaya O(N²).
+
+Mode `stateless_step` tersedia sebagai opsi hemat memori: context dirakit ulang per turn dan sesi langsung ditutup setiap selesai satu panggilan model.
+
 Agent tidak menerima seluruh workspace.
 
 Context default:

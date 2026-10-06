@@ -248,6 +248,21 @@ risk:
 
     `approval_delivery` mengatur jalur notifikasi, bukan permission, approval, atau expiry. Jika tidak dikonfigurasi, gunakan `immediate`; konfigurasi invalid ditolak, jangan memakai fallback yang melonggarkan policy. Saat `high_mode: digest`, `digest_interval_seconds` dan `max_items_per_card` wajib finite dan positif. Batas item memecah kartu, bukan auto-grant overflow. Akhir siklus berarti scheduler quiescent tanpa task runnable; task yang parked tidak membuat sistem menunggu hingga terminal. Persist waktu/membership notifikasi untuk restart. Critical selalu immediate dan tidak dapat diturunkan lewat setting; path/intent high tetap tunduk pada klasifikasi critical.
 
+# Session Policy & Prompt Caching (5A.4, 72A.5)
+session_policy:
+  mode: sticky_until_done   # Opsi: sticky_until_done | stateless_step (default: sticky_until_done)
+  max_turns_before_flush: 15 # Batas maksimal putaran sebelum paksa ringkas & reset window
+  enable_prompt_caching: true
+
+`session_policy.mode: sticky_until_done` mempertahankan thread/sesi provider hidup selama task berjalan aktif (`running`) agar agen tidak kehilangan alur pemikiran saat bolak-balik eksekusi tool. Context Manager menyusun hierarki prompt dari statis ke dinamis untuk memaksimalkan Prompt Cache Hit Rate: `System Prompt & Role` → `Tool Schemas` → `PROJECT_MAP.md` → `Recent History` → `Input Baru`. Konsumsi token per turn ditangkap real-time via metrik `cached_input_tokens` di payload response (72A.5 `usage`).
+
+Sesi provider/thread RAM wajib di-flush dan ditutup jika:
+- Task mencapai status terminal (`completed`, `failed`, `cancelled`).
+- Task masuk kondisi parkir atau jeda lama (`awaiting_approval`, `paused`, `interrupted`, `blocked`). Di titik ini, ringkasan dan checkpoint dipersist ke SQLite, worker dilepas (0 CPU/RAM), dan sesi provider ditutup (#40.1).
+- Turn mencapai `max_turns_before_flush`: ringkasan otomatis dibuat via Summarizer, disimpan ke SQLite, lalu sesi di-reset untuk mencegah context rot dan lonjakan biaya O(N²).
+
+`session_policy.mode: stateless_step` tersedia sebagai opsi hemat memori: context dirakit ulang per turn dan sesi langsung ditutup setiap selesai satu panggilan model.
+
 ---
 
 # 37. Storage

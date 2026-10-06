@@ -40,6 +40,7 @@ Aturan ini ditegakkan oleh runtime, bukan oleh prompt agent.
 | I20 | Compiler Gate & Local Toolchain menggunakan **log inactivity timeout** (5 menit tanpa output baru pada `stdout`/`stderr`) untuk mendeteksi deadlock/infinite loop, bukan hard execution timeout durasi total, karena performa kompilasi bervariasi drastis per hardware. Kegagalan build/lint dibatasi maksimal 3 iterasi perbaikan; setelah itu task dibekukan (`status: blocked`) dan dieskalasi ke `escalation_lead` atau manusia. | Tool Runtime + Orchestrator |
 | I21 | Penanganan jaringan terputus menggunakan pendekatan **murni deterministik di Go Runtime** (0 token). Tolak fallback router offline berbasis ONNX/regex. Deteksi jaringan sepenuhnya tugas Go Runtime melalui healthcheck deterministik cepat (socket ping/HEAD request ke DNS publik). Jika internet terkonfirmasi putus, Go Runtime memicu auto-pause via CAS pada SQLite, menyimpan checkpoint dan deadline, lalu melepaskan worker pool. Background daemon memantau pemulihan koneksi dan menerbitkan `task.resumed` saat online kembali tanpa duplikasi event. | Go Runtime + Orchestrator |
 | I22 | Anti-pattern memory disimpan di Vector DB dengan metadata `cognitive_guardrail: true` dan tag `anti-pattern` (keputusan yang ditolak tidak dibuang). Context Manager wajib mengisolasi memori secara struktural menggunakan blok XML saat merakit prompt LLM: rekomendasi positif di `<historical_success>` dan batasan negatif di `<confirmed_blacklist>` di bagian paling bawah. Struktur ini mengunci mekanisme atensi model agar memperlakukan batasan negatif sebagai penalti/filter validasi akhir, bukan contoh untuk ditiru. | Context Manager + Memory Curator |
+| I23 | Session policy dikonfigurasi di `workspace.yaml` (#36) dengan opsi `sticky_until_done` (default) atau `stateless_step`. Mode sticky mempertahankan thread/sesi provider hidup selama task `running` untuk menghindari kehilangan alur pemikiran, dengan hierarki prompt dari statis ke dinamis untuk memaksimalkan Prompt Cache Hit Rate. Sesi wajib di-flush saat task terminal, parked, atau mencapai `max_turns_before_flush` (ringkasan otomatis via Summarizer). Mode stateless hemat memori: context dirakit ulang per turn dan sesi ditutup setiap panggilan. | Context Manager + Orchestrator |
 
 ## 72A.2 Identifier & Addressing
 
@@ -214,7 +215,8 @@ Pemakaian satu model call. Dicatat oleh Cost Tracker (5A.10).
     "model": { "type": "string" },
     "input_tokens": { "type": "integer", "minimum": 0 },
     "output_tokens": { "type": "integer", "minimum": 0 },
-    "cached_input_tokens": { "type": "integer", "minimum": 0 },
+    "cached_input_tokens": { "type": "integer", "minimum": 0,
+                        "description": "token input yang di-cache oleh provider dari session sticky (session_policy.mode: sticky_until_done, #36); 0 jika stateless_step atau cache miss" },
     "duration_ms": { "type": "integer", "minimum": 0 },
     "estimated_cost_usd": { "type": "number", "minimum": 0 }
   }
