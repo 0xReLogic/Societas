@@ -529,7 +529,35 @@ Policy dapat mencakup:
 - external communication
 - deployment
 
-## 5A.17 Scheduler
+## 5A.17 Network Failure Handling (Deterministic Go Runtime)
+
+Sistem **tolak fallback router offline** berbasis ONNX atau regex classifier. Ketika internet mati, Jev AI dan model pekerja eksternal ikut mati, sehingga sistem tidak boleh memaksakan perutean semu.
+
+### Deteksi Murni Level Transport (0 Token)
+
+Deteksi jaringan sepenuhnya menjadi tugas **Go Runtime (Deterministic Enforcer)**, bukan tugas Jev AI atau agen:
+
+- Jika HTTP client Go mendeteksi *network drop* atau *timeout* berulang saat menghubungi API model provider, Go Runtime langsung mengeksekusi healthcheck deterministik cepat (socket ping / HEAD request ke DNS publik stabil seperti `1.1.1.1` atau `8.8.8.8`).
+- Tidak ada loop retry buta, tidak ada LLM yang dipanggil untuk mendiagnosa koneksi.
+
+### Fail-Closed Auto-Pause
+
+Jika internet terkonfirmasi putus:
+
+- Go Runtime langsung memicu transisi state machine di SQLite via CAS (*Compare-And-Swap*): task aktif diubah menjadi `paused` (`phase: requested`).
+- `pause_deadline` disimpan dan checkpoint progress tersimpan di SQLite.
+- Worker pool dilepas untuk menghemat resource.
+- Tidak ada event bus yang menumpuk antrean mati.
+
+### Auto-Resume
+
+Background daemon Go memantau pemulihan koneksi:
+
+- Begitu internet kembali online, Orchestrator menerbitkan event `task.resumed`.
+- Task dilanjutkan dari checkpoint tersimpan tanpa kehilangan konteks atau duplikasi event.
+- Context Manager mengambil progress terakhir dari Operational Store (SQLite, #37.1).
+
+## 5A.18 Scheduler
 
 Scheduler mengatur kapan task dijalankan.
 
@@ -550,7 +578,7 @@ Scheduler harus mendukung:
 - cancellation
 - timeout
 
-## 5A.18 Stop Conditions
+## 5A.19 Stop Conditions
 
 Setiap run harus memiliki stop condition.
 
@@ -566,7 +594,7 @@ Contoh:
 
 Agent tidak boleh terus berpikir tanpa batas.
 
-## 5A.19 Maximum Iterations
+## 5A.20 Maximum Iterations
 
 ```yaml
 limits:
@@ -576,7 +604,7 @@ limits:
 
 Setiap loop autonomous harus memiliki upper bound.
 
-## 5A.20 Approval Escalation
+## 5A.21 Approval Escalation
 
 Jika agent ingin melakukan sesuatu di luar budget/policy:
 
@@ -600,7 +628,7 @@ Human dapat:
 - Approve For Task
 - Reject
 
-## 5A.21 Cheap Path vs Expensive Path
+## 5A.22 Cheap Path vs Expensive Path
 
 Sistem harus memiliki dua jalur.
 
@@ -660,7 +688,7 @@ Untuk pekerjaan kompleks/high-impact.
 
 Orchestrator memilih jalur berdasarkan task.
 
-## 5A.22 Example Token-Efficient Workflow
+## 5A.23 Example Token-Efficient Workflow
 
 User:
 
@@ -699,7 +727,7 @@ YOU
 
 Agent berikutnya tidak otomatis mendapatkan seluruh transcript.
 
-## 5A.23 Context Caching
+## 5A.24 Context Caching
 
 Jika provider mendukung caching, gunakan untuk context yang stabil.
 
@@ -712,7 +740,7 @@ Contoh yang stabil:
 
 Bagian ini tidak perlu selalu dihitung sebagai context baru jika provider mendukung caching.
 
-## 5A.24 Semantic Retrieval
+## 5A.25 Semantic Retrieval
 
 Memory/artifact retrieval sebaiknya menggunakan relevance.
 
@@ -738,7 +766,7 @@ Ignore:
 
 ID hasil retrieval difilter deterministik di Go sebelum masuk context budget: memori yang `superseded` atau `stale` dibuang, dan skor dipengaruhi faktor umur (time-decay) — lihat **#19.6 Memory Curation**.
 
-## 5A.25 Token Visibility
+## 5A.26 Token Visibility
 
 Dashboard **tidak melakukan fetch eksternal ke provider secara live** untuk merender grafik biaya — semua angka dibaca dari SQLite sebagai Single Source of Truth (#32.1), sesuai prinsip Local-First.
 
@@ -762,7 +790,7 @@ Reviewer     $0.30
 
 User dapat melihat agent mana yang paling mahal.
 
-## 5A.26 Budget Dashboard
+## 5A.27 Budget Dashboard
 
 Dashboard menampilkan:
 
@@ -782,7 +810,7 @@ WARNING:
 80% of budget consumed.
 ```
 
-## 5A.27 AI Control Plane Acceptance Criteria
+## 5A.28 AI Control Plane Acceptance Criteria
 
 Control Plane dianggap selesai jika:
 
