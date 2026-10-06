@@ -1,0 +1,422 @@
+<!-- Doc 09 — Security, Sandbox, Tools, Observability, Protocol (§57–72)
+     Bagian dari societas-full-product-spec. Urutan dokumen diatur di README.md.
+     Nomor section dipertahankan; referensi silang antar-doc memakai nomor section (#N, 5A.x, 72A.x). -->
+
+# 57. Security Model
+
+Security menjadi bagian inti walaupun project personal.
+
+Minimal:
+
+- credentials di environment/config
+- secrets tidak masuk log
+- permission per agent
+- command sandbox/restriction
+- approval workflow
+- workspace isolation
+- path restrictions
+- network restrictions
+
+---
+
+# 58. Secret Management
+
+Provider credentials tidak boleh ditulis langsung ke prompt agent.
+
+Gunakan:
+
+```text
+environment variables
+secret store
+OS credential store
+encrypted local config
+```
+
+Agent hanya mendapat secret yang benar-benar diperlukan.
+
+---
+
+# 59. Tool Sandbox
+
+Sandboxing memakai **Deterministic Guard di level backend Go**, divalidasi sebelum proses dieksekusi — bukan blocklist, dan tanpa state-observer snapshot yang berat.
+
+```yaml
+shell:
+  # Strict Allowlist (default-deny): binary di luar daftar ditolak
+  allowed:
+    - go
+    - git
+    - npm
+    - cargo
+    - make
+
+  # Path Jailing: eksekusi terkunci mutlak di ./workspace
+  cwd_jail: "./workspace"
+  reject_args_containing:
+    - "../"      # path traversal
+    - "/"        # direktori absolut (/, /etc, ...)
+    - "~"        # path home
+
+  # Mutasi direktori berskala besar -> human approval (#22.3, #23)
+  require_approval:
+    - large_directory_mutation
+```
+
+Pelanggaran guard ditolak secara deterministik oleh Policy Engine dan dicatat sebagai event penolakan.
+
+## 59.1 OS-Level Isolation (Requirement Utama)
+
+String filtering (#22.2) **bukan sandbox** — binary allowlist mengeksekusi kode arbitrary dan symlink dapat keluar dari jail. Karena itu setiap eksekusi shell/build/test **wajib** berjalan di dalam isolasi level OS:
+
+- **Linux Landlock** atau **Bubblewrap**, atau
+- **Ephemeral container** (Docker / Podman sekali pakai) yang me-mount folder task secara terisolasi tanpa akses network luar (kecuali network dibutuhkan tool dan diizinkan policy).
+
+Saat Engineer Agent menjalankan shell (kompilasi, install dependency, run test), Tool Runtime Go memutar lingkungan terisolasi ini; seberapa ganas pun perintah agen (bahkan `rm -rf /`), yang rusak hanya lingkungan virtual — bukan mesin host. Lingkungan dimatikan dan dihapus begitu eksekusi tool selesai.
+
+Deterministic Guard (#22) tetap aktif sebagai lapis kedua di dalam isolasi.
+
+---
+
+# 60. Git Integration
+
+Engineer agent harus dapat:
+
+```bash
+git status
+git diff
+git branch
+git commit
+```
+
+Advanced:
+
+```text
+create branch
+implement
+test
+commit
+generate patch
+request review
+```
+
+Deployment tidak otomatis.
+
+## 60.1 Git Worktree Isolation per Task
+
+Agen **tidak mengoding langsung di folder utama** `./workspace` — rawan bentrok saat task berjalan paralel. Untuk setiap task baru (`TASK-001`), backend Go otomatis membuat `git worktree` terpisah di folder tersembunyi:
+
+```text
+.worktrees/TASK-001/    (branch terpisah per task)
+```
+
+Keuntungan:
+
+- Setiap agen punya "kamar kerja" sendiri pada branch terpisah.
+- Kalau agen salah coding atau bikin error, cukup hapus worktree tersebut tanpa merusak folder kerja utama sama sekali.
+- Penggabungan ke branch utama (`main`) baru terjadi saat task dinyatakan `completed` dan di-approve oleh human.
+
+Path Jailing (#22.2) tetap berlaku — jail scope diarahkan ke worktree task, bukan root workspace.
+
+## 60.2 Worktree Safety
+
+- **Concurrency mutex:** operasi administratif git (`worktree add`/`remove`) dilindungi mutex — dicegah race condition pada `.git/index.lock` saat task paralel dimulai/selesai bersamaan.
+- **Startup Reaper:** saat boot, backend menjalankan `git worktree prune` dan membersihkan orphan worktree yang tidak terikat task aktif di SQLite.
+- **Git subcommand restrictions:** agen dilarang menjalankan destructive command di luar worktree miliknya (mis. `branch -D`, `reset --hard` pada repo utama) — allowlist subcommand git divalidasi Policy Engine per worktree scope.
+- **Shared dependency cache:** dependency manager memakai cache global (pnpm store, Go mod cache) agar disk tidak membengkak karena `node_modules`/deps di tiap worktree.
+
+---
+
+# 61. Research Integration
+
+Research agent dapat menghasilkan:
+
+```text
+research/
+├── sources.md
+├── summary.md
+├── comparison.md
+└── recommendations.md
+```
+
+Source metadata harus disimpan.
+
+---
+
+# 62. Browser / Search Tool
+
+Riset web tidak membangun headless browser lokal sendiri — tool `search`/`open`/`extract` langsung mengandalkan **server MCP pencarian** (mis. **Tavily** atau **Exa**) yang dihubungkan via MCP Client (#21.1).
+
+Tool interface:
+
+```text
+search(query)   -> MCP search server (Tavily / Exa)
+open(url)       -> fetch & extract via MCP server
+extract()       -> hasil ekstraksi terstruktur
+```
+
+Tool result masuk ke event system.
+
+---
+
+# 63. Structured Tool Calls
+
+Tool call harus memiliki schema dan diteruskan lewat **MCP Client** (#21.1): agen mengeluarkan call terstruktur, Tool Runtime meneruskannya ke MCP server yang bersangkutan, dan result terstruktur dikembalikan sebagai event.
+
+Contoh:
+
+```json
+{
+  "tool": "git.diff",
+  "arguments": {}
+}
+```
+
+Result:
+
+```json
+{
+  "status": "ok",
+  "output": "...",
+  "duration_ms": 42
+}
+```
+
+Contoh di atas disederhanakan. Schema lengkap (`tool_call_id`, `output_artifact_id`, `error`, batas output inline) ada di **Section 72A.8**, dan alur baku tool call di **72A.10**.
+
+---
+
+# 64. Observability
+
+System harus menyediakan:
+
+```text
+agent runtime metrics
+task metrics
+tool metrics
+transport metrics
+model metrics
+storage metrics
+```
+
+Contoh:
+
+```text
+active_agents
+active_tasks
+messages_per_second
+tool_calls_total
+task_failures_total
+model_latency
+event_bus_publish_latency
+event_bus_subscribe_latency
+memory_usage
+```
+
+---
+
+# 65. Logging
+
+Structured logs:
+
+```json
+{
+  "level": "INFO",
+  "event": "task_completed",
+  "agent_id": "research",
+  "task_id": "TASK-100",
+  "duration_ms": 12043
+}
+```
+
+Jangan log:
+
+- API key
+- access token
+- password
+- raw credentials
+- private secrets
+
+---
+
+# 66. Tracing
+
+Gunakan correlation ID agar satu pekerjaan dapat diikuti.
+
+## 66.1 Local Tracing & Waterfall Telemetry (OpenTelemetry)
+
+Sistem memasang **tracing lokal bawaan yang dapat diekspor ke format OpenTelemetry**. Di Web Dashboard, pengguna melihat diagram waterfall (seperti tab Network di DevTools) untuk satu run/task:
+
+```text
+span ChromaDB query        |██| 12ms
+span model call (Anthropic)|██████████| 4.2s
+span tool call (git.diff)  |█| 42ms
+span child task branch     |████████████| 8.7s
+```
+
+Waterfall menunjukkan:
+
+- berapa milidetik dihabiskan query ChromaDB / Vector DB
+- berapa lama API model memproses prompt
+- jalur cabang task mana yang paling memakan waktu dan biaya
+
+Correlation ID dan span mengikuti event di Event Bus antar-agen.
+
+```text
+User Request
+   ↓
+CEO
+   ↓
+Task
+   ↓
+Research
+   ↓
+Tool
+   ↓
+Artifact
+   ↓
+CEO
+   ↓
+Human
+```
+
+---
+
+# 67. Agent Run
+
+Setiap execution agent dibuat sebagai run.
+
+Contoh:
+
+```yaml
+run_id: RUN-001
+agent: research
+task: TASK-001
+started_at: ...
+finished_at: ...
+status: completed
+```
+
+Run menyimpan:
+
+- input
+- model
+- tool calls
+- output
+- artifacts
+- errors
+- usage
+
+---
+
+# 68. Replay / Debugging
+
+User dapat membuka run dan melihat:
+
+```text
+00:00 task received
+00:01 context loaded
+00:03 model started
+00:08 search.call
+00:09 search.result
+00:12 model resumed
+00:18 artifact created
+00:20 completed
+```
+
+Ini penting untuk memahami agent behavior.
+
+---
+
+# 69. Agent Context
+
+Context disusun dari:
+
+```text
+system prompt
+role
+workspace context
+task context
+memory
+recent messages
+tool results
+artifacts
+```
+
+Jangan memasukkan seluruh workspace setiap kali.
+
+Context builder harus selektif.
+
+---
+
+# 70. Context Budget
+
+Agent memiliki budget context.
+
+System harus memprioritaskan:
+
+1. current task
+2. recent relevant messages
+3. relevant artifacts
+4. trusted memory
+5. old history
+
+Budget context adalah bagian dari budget agent (5A.2), dan hasil seleksi dicatat lewat event `context.built` (72A.8) berikut alasan tiap item.
+
+Alokasi awal yang disarankan (dapat dikonfigurasi):
+
+| Bagian | Porsi |
+|--------|-------|
+| System prompt + role | 15% |
+| Current task | 15% |
+| Artifact / summary relevan | 30% |
+| Memory terpercaya | 15% |
+| Recent messages + tool results | 20% |
+| Cadangan | 5% |
+
+---
+
+# 71. Agent-to-Agent Protocol
+
+Protocol minimal:
+
+```text
+HELLO
+AUTH
+REGISTER
+SUBSCRIBE
+PUBLISH
+TASK
+MESSAGE
+TOOL
+ARTIFACT
+HEARTBEAT
+ACK
+ERROR
+GOODBYE
+```
+
+Protocol harus versioned.
+
+Frame di atas adalah lapisan transport. Isi frame `PUBLISH`, `TASK`, `MESSAGE`, dan `TOOL` adalah **envelope** yang didefinisikan di **Section 72A.3**.
+
+---
+
+# 72. Protocol Versioning
+
+Contoh:
+
+```text
+societas/1
+```
+
+Setiap message memiliki:
+
+```text
+protocol_version
+message_type
+schema_version
+```
+
+Breaking changes harus memiliki migration path.
+
+---
