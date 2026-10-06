@@ -30,15 +30,19 @@ idle
 
 Status agent harus terlihat pada dashboard.
 
+State agent menggambarkan aktivitas dan berbeda dari enum status task. Task yang menunggu approval dapat diparkir, sementara agennya kembali `idle` atau mengambil task independen lain (#40.1); state task kanonik tetap mengikuti 72A.6.
+
 ---
 
 # 7. Task System
 
 Task adalah unit pekerjaan. Task tidak langsung dieksekusi dari prompt mentah user — ia melewati **Intake Pipeline berjenjang** (lihat #7.1) sebelum mencapai Worker Agent.
 
+Untuk onboarding, pahami dulu task sebagai unit ber-goal, owner, status, dependency, budget, dan output. Lompat ke #8 untuk melihat hubungan antar-task; detail mesin intake #7.1 dapat dibaca setelah #5A.
+
 ## 7.1 Intake & Routing Pipeline
 
-Instruksi user diproses berjenjang sebelum task dieksekusi:
+Instruksi user diproses berjenjang sebelum task dieksekusi. Bagian ini menjelaskan routing yang disebut di #5A.1 dan dapat dibaca setelah model control plane dipahami:
 
 ### 1. Intake Layer (Front-Office Sanitizer)
 
@@ -48,7 +52,7 @@ Instruksi user diproses berjenjang sebelum task dieksekusi:
 
 **Maintenance `PROJECT_MAP.md` (anti-basi):** file ini **tidak boleh di-update manual** — akan basi dalam hitungan minggu dan Intake mulai salah nebak target modul. `PROJECT_MAP.md` digenerate ulang secara deterministik oleh backend Go (struktur direktori via `tree -d -L 3` + deskripsi singkat per modul) **setiap kali ada task yang berhasil di-merge ke `main`** (lihat #60.4). Generator ini berjalan sebagai task background 0 token — bukan LLM call.
 
-Untuk final-candidate approval (I17, 72A.10), jalankan generator juga **sesudah rebase dan sebelum freeze/gate/review** agar perubahan map ikut tree yang disetujui. Regenerasi otomatis setelah merge harus menghasilkan konten identik/verifikasi; perbedaan tidak boleh diam-diam membuat commit baru ke `main`, melainkan masuk pekerjaan perbaikan dengan gate/review/approval baru. Format sumber deskripsi per modul tetap keputusan terpisah, bukan ditentukan oleh aturan binding ini.
+Untuk final-candidate approval (I17/I19, 72A.10), jalankan generator **sesudah rebase dan sebelum freeze, build gate, Semantic Rebase, atau review** agar perubahan map ikut candidate tree yang benar-benar diuji. Semantic evidence mengikat versi map dalam candidate. Setelah merge receipt terkonfirmasi, regenerasi otomatis harus menghasilkan konten identik; perbedaan masuk task perbaikan dengan rebase, gate, Semantic Rebase, review, dan approval baru, bukan commit diam-diam ke `main`. Format/sumber deskripsi per modul tetap keputusan terpisah dan wajib menjadi input candidate bila memengaruhi hasil intake.
 
 ### 2. Cognitive Router (Jev AI — System 1 Decision Engine)
 
@@ -109,7 +113,7 @@ Bentuk lengkap task (field, tipe, dan state machine) ada di **Section 72A.5 dan 
 
 # 8. Task Graph
 
-Task dapat membentuk graph.
+Task membentuk **DAG** (directed acyclic graph): node adalah task, edge adalah dependency, dan siklus tidak diperbolehkan. Task yang tidak saling bergantung dapat berjalan paralel; task yang menunggu dependency baru siap setelah pendahulunya menghasilkan output.
 
 Contoh:
 
@@ -137,6 +141,8 @@ Task dapat berjalan:
 - sequential
 - parallel
 - conditional
+
+Sesudah memahami lifecycle dan DAG, lanjutkan ke [§5A AI Control Plane](02-ai-control-plane.md): mesin yang menjadwalkan task/agen dan mengontrol token, biaya, model, serta context. Setelah itu kembali ke #7.1 untuk intake dan #9 untuk delegation.
 
 ---
 

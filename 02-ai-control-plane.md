@@ -4,6 +4,8 @@
 
 # 5A. AI Control Plane
 
+**Prasyarat model mental:** [§6–8](03-tasks-and-lifecycle.md) menjelaskan lifecycle agent, task, dan DAG. Baca bagian itu setelah §5 dan sebelum detail control plane ini. Nomor section tetap dipertahankan; urutan linear ada di README.
+
 AI Control Plane adalah otak pengatur seluruh sistem multi-agent.
 
 Event Bus hanya menangani komunikasi. Agent hanya menjalankan pekerjaan. Keputusan tentang **siapa melakukan apa, kapan, dengan context apa, dan berapa budget** berada di Control Plane.
@@ -317,6 +319,8 @@ Jev AI dan Model Router hanya boleh merutekan ke **ID agen yang aktif terdaftar*
 **Dynamic Enum Injection:** saat runtime Go menyiapkan tool schema / JSON Schema delegasi untuk agen, field `requested_assignee` wajib dikunci memakai `enum` dinamis berisi ID agen aktif dari `workspace.yaml` + `null`. Dengan constrained decoding provider, LLM terkunci secara matematis — tidak bisa mengarang ID fiktif, sehingga siklus re-prompting boros token di model tier tinggi hilang. Penolakan karena salah nama agen tidak lagi mungkin terjadi (lihat 72A.8, 72A.10).
 
 Risk-aware routing: jika task memiliki `risk_tier: critical` (lihat #23.1, 72A.5), Model Router **otomatis menaikkan pengerjaan ke model tier tinggi (thinking mode)** dan menyuntikkan audit keamanan wajib — terlepas dari skor confidence. Eksekusi mutasi task tersebut tetap terkunci hingga disetujui manusia.
+
+`Flash` adalah label tampilan untuk jalur murah dan dipetakan ke tier wire `cheap`, bukan tier model tambahan. Semantic triage mengikuti Model Router, Budget Manager, rate limit, serta policy yang sama; label Flash tidak dapat menurunkan tier atau melewati escalation `critical` ke `strong`.
 
 ### Provider Rate Limiter (Token Bucket per API Key)
 

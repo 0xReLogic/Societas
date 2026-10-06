@@ -398,4 +398,8 @@ Tim operasional: ops_lead, support_agent, finance_checker
 
 Semua peran, batasan izin tools, tier model, dan system prompt didefinisikan deklaratif di YAML.
 
+## Urutan Baca
+
+Setelah §5, pahami dulu [§6 Agent Lifecycle](03-tasks-and-lifecycle.md#6-agent-lifecycle), [§7 Task System](03-tasks-and-lifecycle.md#7-task-system), dan [§8 Task Graph](03-tasks-and-lifecycle.md#8-task-graph). Ini memberi model konkret tentang aktivitas agen dan task paralel sebelum membaca [§5A AI Control Plane](02-ai-control-plane.md), yang mengatur scheduler, budget, routing Jev, dan context window. Setelah itu kembali ke §7.1/§9 untuk intake dan delegation lengkap, lalu lanjutkan Doc 04–10. Urutan section tidak diubah; detail jalur baca ada di README.
+
 ---

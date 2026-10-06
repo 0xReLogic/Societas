@@ -82,9 +82,22 @@ Approval bersifat risk-aware. Evaluasi risiko dilakukan **dinamis** lewat konfig
 - `path_patterns`: mis. `migrations/**`, `src/auth/**`, `infra/**`, `contracts/**`
 - `intent_keywords`: mis. `drop database`, `secret`, `deploy`, `payout`
 
-Task yang terklasifikasi `risk_tier: critical` **dikunci**: semua eksekusi mutasi wajib human approval sebelum dijalankan, terlepas dari autonomy level agen (lihat #24, 5A.8).
+Task `risk_tier: critical` **dikunci**: semua eksekusi mutasi wajib `delivery_mode: immediate` dan human approval sebelum dijalankan, terlepas dari autonomy level agen (lihat #24, 5A.8). Aksi `risk_tier: high` yang memerlukan approval masuk `delivery_mode: digest` dan tidak boleh dieksekusi sebelum grant tervalidasi.
 
 Runtime Escalation: jika agen di tengah jalan mencoba mengakses file di luar rencana yang masuk kategori kritis (`path_patterns` critical), Policy Engine **otomatis menaikkan status menjadi `risk_tier: critical`**, membekukan eksekusi, dan meminta human approval — tanpa menunggu klasifikasi ulang task.
+
+Mode delivery mengikuti klasifikasi akhir setelah runtime escalation: setiap kenaikan ke `critical` membatalkan eligibility digest dan memicu synchronous halt; itemnya di-skip dari manifest, bukan disetujui atau ditampilkan sebagai persetujuan langsung. Perubahan `path_patterns`/policy yang terikat snapshot membatalkan approval lama dan memerlukan evaluasi serta request baru.
+
+## 23.2 Human Attention Budget & Digest Approval
+
+Human attention adalah resource terbatas, bukan budget token. Risk mengatur urgensi notifikasi, bukan kekuatan approval binding atau izin tool.
+
+- **Critical → immediate / Synchronous Halt.** Drop table, force push, breaking consensus, dan transfer funds menghentikan mutasi serta dependency yang terdampak sebelum side effect; kirim notifikasi segera dan wajib keputusan individual. Tidak masuk digest atau **Approve All**. Worker task tetap dilepas; task independen/workspace lain tidak otomatis dihentikan.
+- **High → digest bila mode aktif.** Mutasi rute API/dependensi, cleanup cache, atau shell terisolasi hanya contoh klasifikasi policy, bukan izin otomatis. Request diparkir dan dihimpun menurut interval/akhir siklus (#33.7/#36). Path critical mengalahkan high; command di luar allowlist tetap deny.
+
+`awaiting_approval (batch)` adalah label UI untuk `status: awaiting_approval` + request `delivery_mode: digest`, **bukan enum task baru**. SQLite menyimpan checkpoint, snapshot/request, expiry, dan relasi manifest. Worker/goroutine/working set task dilepas saat menunggu (#40.1); agen boleh mengambil backlog independen yang lolos dependency, permission, budget, dan concurrency guard.
+
+**Approve All Validated** hanya satu klik presentasi. Backend mengikat daftar yang dilihat ke manifest artifact/version/hash, memvalidasi ulang tiap request dan menerbitkan grant `scope: once` per item (I18, 72A.8). Critical, stale, expired, rejected, changed input, atau already-processed tidak otomatis disetujui; hasil parsial menyebutkan alasan. Scope/grant tetap I17/I16. Summary Manager/LLM tidak dapat menambah item, mengubah risk, atau memberi approval.
 
 ---
 
@@ -204,7 +217,7 @@ Engineer tidak otomatis boleh melakukan deployment production.
 
 Output kode Engineer selalu melewati **Deterministic Toolchain Runner** (pipeline build/lint/test lokal, 0 token, fail-fast) sebelum diserahkan ke Reviewer (lihat 5A.21, #29, `toolchain` di #36).
 
-Mekanisme penulisan kode ke worktree memakai **Search & Replace Block** (#60.3) — Engineer tidak menulis ulang seluruh file dan tidak mengarang header unified diff. Serial Merge Queue (#60.4) melakukan rebase/resolve, freeze kandidat final, lalu **mengulang gate dan Reviewer sebelum approval**. Approval mengikat commit/tree + expected base + recipe/evidence; perubahan kandidat/base membatalkan approval (I17, 72A.8/72A.10). Conflict dikembalikan ke Engineer, bukan user.
+Mekanisme penulisan kode ke worktree memakai **Search & Replace Block** (#60.3) — Engineer tidak menulis ulang seluruh file dan tidak mengarang header unified diff. Serial Merge Queue (#60.4) melakukan rebase/resolve → freeze candidate → deterministic gate → Semantic Rebase → Reviewer → approval. Snapshot mengikat commit/tree/base, gate/semantic/review evidence dan recipe; perubahan input membatalkan approval/evidence (I17/I19, 72A.8/72A.10). Textual conflict kembali ke Engineer; semantic conflict/inconclusive diparkir untuk `escalation_lead` (#48.5) dan refactor asinkron, bukan langsung merge.
 
 Untuk integrasi kontrak/API, Engineer mengikuti alur **Contract-First** (#17.1): codegen binding otomatis + `contract.lookup`, bukan menulis call manual.
 

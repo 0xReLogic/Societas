@@ -125,8 +125,8 @@ Context selama satu execution.
 
 Setiap level memory di atas di-map ke pilar penyimpanan:
 
-- Agent Memory & Workspace Memory: entry terstruktur (sumber, timestamp, scope) di SQLite; isi naratifnya di-embed ke Vector DB agar dapat di-retrieve semantik.
-- Task Memory: relasi task -> artifact/memory disimpan di SQLite; ringkasannya di-embed untuk retrieval.
+- Agent Memory & Workspace Memory: entry terstruktur (sumber, timestamp, scope) di SQLite; hanya narasi yang lolos admission guard #19.6 boleh di-embed ke Vector DB.
+- Task Memory: relasi task -> artifact/memory disimpan di SQLite; ringkasan tidak otomatis di-embed dan tetap melewati admission guard #19.6.
 - Run Memory: append-only di event log SQLite; tidak di-embed (ephemeral).
 
 Retrieval semantik selalu melewati Vector DB dan mengembalikan ID referensi (5A.24) — bukan pencarian teks mentah di SQLite.
@@ -137,12 +137,15 @@ Vector DB bekerja berdasarkan kemiripan teks (cosine similarity), **bukan status
 
 Empat aturan kurasi deterministik di Go + SQLite — tanpa algoritma AI tambahan:
 
-1. **Filter pintu masuk — jangan embed semua hal.** Yang boleh di-embed ke Cognitive Store hanya `decision.md` yang sudah di-approve manusia dan dokumentasi final yang kodenya sudah di-merge ke `main`. Dilarang di-embed: chat/debat antar-agen, log error terminal & test gagal, draft yang belum di-approve.
+1. **Filter pintu masuk — jangan embed semua hal.** Keputusan/spec hanya boleh di-embed setelah human approval untuk versi yang terikat, Semantic Rebase `PASS` (#60.4), dan merge receipt resmi ke `main` terkonfirmasi (I19). Approval abstrak atau Git rebase bersih saja tidak cukup. Dokumentasi final harus berasal dari kode yang sudah merge. Chat/debat/transkrip arbitrase, keputusan kandidat belum merge, log error/test gagal, draft, proposal kalah, dan putusan lead yang belum lolos pipeline dilarang di-embed.
 2. **Pola Supersede (tombstone di SQLite).** Tabel `artifacts` memiliki kolom `superseded_by` (ID artifact pengganti). Saat keputusan baru menggantikan yang lama, record lama ditandai — bukan dihapus. Setiap ID hasil retrieval Vector DB wajib di-filter ulang ke SQLite: `superseded_by != NULL -> skip`. Dokumen basi tidak pernah masuk context LLM lagi.
 3. **Time-decay scoring.** Skor akhir retrieval = `vector_similarity x faktor_umur` (mis. dokumen minggu ini x1.0, 3 bulan x0.5), dihitung deterministik di Go — dokumen lama yang kebetulan mirip kalah dari dokumen baru yang relevan.
 4. **Ikat memori ke git commit / path.** Setiap entry memori menyimpan metadata `source_path` (mis. `crates/storage/src/nullifier.rs`) dan commit hash. Background GC mengecek via git: jika file/fungsi sudah dihapus atau di-rename di `main`, memori ditandai `stale` dan dibersihkan dari Vector DB.
+5. **Semantic admission guard.** Sebelum embedding, Go mencocokkan approval ID/hash dan snapshot version, semantic evidence version/checksum, serta merge receipt terkonfirmasi. Ketiganya harus mengikat workspace/run/task, base/candidate commit/tree, recipe/policy, dan decision artifact versions/checksums yang sama. Periksa status/tombstone/freshness di SQLite; saat conflict, inconclusive, approval pending, atau receipt belum direkonsiliasi, simpan artifact di Operational Store/quarantine saja. `task.completed`, ringkasan LLM, atau verdict lead bukan merge receipt dan agent tidak dapat memberi flag `passed` sendiri.
 
 Prinsip: Vector DB adalah **perpustakaan buku yang sudah lulus kurasi** — bukan tempat sampah. Edisi lama ditarik dari rak saat revisi terbit.
+
+Semantic triage mengambil exact-version Git/SQLite/artifact sebagai input; dilarang mengambil proposal dari Vector DB atau memakai similarity untuk menghidupkan zombie memory. Setelah replacement valid admitted, tombstone/supersede menarik versi lama lewat mekanisme existing. Provenance fingerprint/freshness lintas source tetap W11/W12; non-Git admission belum ditetapkan (W15) dan karena itu tidak eligible secara default.
 
 ---
 
@@ -156,7 +159,7 @@ Memory harus memiliki:
 - scope
 - owner
 
-Jangan memasukkan semua chat ke memory secara otomatis — hanya keputusan ter-approve dan dokumentasi pasca-merge yang boleh di-embed (#19.6).
+Jangan memasukkan semua chat ke memory secara otomatis — hanya keputusan/spec ter-approve + semantic pass + merge receipt terkonfirmasi yang boleh di-embed (#19.6).
 
 Memory harus memiliki lifecycle.
 

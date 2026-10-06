@@ -92,6 +92,20 @@ class AuditTests(unittest.TestCase):
         )
         self.assert_failed(report, "probe:approval_example_git.merge")
 
+    def test_semantic_decision_content_drift_is_detected(self) -> None:
+        report = self.run_fixture(
+            "Keep transport calls behind the adapter boundary.",
+            "Change the base decision without issuing a new semantic evidence ref.",
+        )
+        self.assert_failed(report, "probe:approval_example_git.merge")
+
+    def test_arbitration_must_bind_conflict_evidence(self) -> None:
+        report = self.run_fixture(
+            '"checksum": "sha256:7186b9d33078268d83422acdf59d197ca6f0dd9e0ee607014b611400860cce2f"',
+            '"checksum": "sha256:' + "f" * 64 + '"',
+        )
+        self.assert_failed(report, "arbitration_decision_matches_semantic_evidence")
+
     def test_lost_snapshot_fixture_is_detected(self) -> None:
         report = self.run_fixture("<!-- fixture:approval_budget -->", "<!-- untagged -->")
         self.assert_failed(report, "approval_fixtures_present")
@@ -99,6 +113,20 @@ class AuditTests(unittest.TestCase):
     def test_reordered_merge_gate_is_detected(self) -> None:
         report = self.run_fixture("5. Gate build/lint/test", "5. Skip build/lint/test")
         self.assert_failed(report, "documented_merge_order")
+
+    def test_batch_item_receipt_hash_mismatch_is_detected(self) -> None:
+        report = self.run_fixture(
+            '"batch_hash": "sha256:af70e4125e2376b0c361265f48d3f87969de9caad43e8ec6c8a8d2ab77468720"',
+            '"batch_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"',
+        )
+        self.assert_failed(report, "batch_item_receipt_matches_manifest")
+
+    def test_digest_mode_rejects_non_high_risk(self) -> None:
+        report = self.run_fixture(
+            '"delivery_mode": "immediate"',
+            '"delivery_mode": "digest"',
+        )
+        self.assert_failed(report, "example:approval.requested")
 
     def test_cas_without_expected_base_is_detected(self) -> None:
         report = self.run_fixture(
@@ -120,7 +148,6 @@ class AuditTests(unittest.TestCase):
             '"policy_hash", "inputs"],',
         )
         self.assert_failed(report, "probe:snapshot_approval_budget_missing_contract_hash")
-
 
 if __name__ == "__main__":
     unittest.main()

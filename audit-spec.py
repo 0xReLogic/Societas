@@ -27,7 +27,7 @@ ROW = re.compile(r"^\| `([\w.]+)` \| `(\w+)` \|", re.M)
 NUMBER = re.compile(r"^#{1,6} (\d+[A-Z]?(?:\.\d+)*)\.? ", re.M)
 TASK_EVENTS = {
     "task.paused", "task.resumed", "task.interrupted",
-    "task.rebase_conflict", "task.contract_changed",
+    "task.rebase_conflict", "task.semantic_conflict", "task.contract_changed",
 }
 
 
@@ -100,6 +100,12 @@ def boundary_errors(
         reference = payload.get("snapshot_ref")
         if isinstance(reference, dict) and reference.get("checksum") != payload.get("bound_hash"):
             errors.append("snapshot checksum must equal bound_hash")
+    if event_type == "approval.batch_submitted":
+        reference = payload.get("batch_ref")
+        if isinstance(reference, dict) and reference.get("checksum") != payload.get("batch_hash"):
+            errors.append("batch checksum must equal batch_hash")
+        if event.get("from") != "human:user" or event.get("to") != "system:orchestrator":
+            errors.append("batch submit sender/target mismatch")
     if event_type == "approval.invalidated":
         if event.get("from") != "system:orchestrator" or event.get("to") != "human:user":
             errors.append("invalidation sender/target mismatch (not an auth check)")
@@ -116,6 +122,78 @@ def snapshot_digest(value: Any) -> str:
     return "sha256:" + hashlib.sha256(rfc8785.dumps(value)).hexdigest()
 
 
+def semantic_input_errors(
+    evidence: dict[str, Any],
+    artifacts: dict[tuple[str, int], bytes],
+    schemas: dict[str, dict[str, Any]],
+    registry: Registry,
+    *,
+    current: dict[str, Any] | None = None,
+) -> list[str]:
+    """Validate exact-version decision registry inputs; not model quality/provenance."""
+    errors: list[str] = []
+    index_ref = evidence.get("decision_index_ref", {})
+    index_bytes = artifacts.get((index_ref.get("artifact_id"), index_ref.get("version")))
+    if index_bytes is None or "sha256:" + hashlib.sha256(index_bytes).hexdigest() != index_ref.get("checksum"):
+        return ["semantic decision index version/checksum unavailable or changed"]
+    try:
+        index = json.loads(index_bytes, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+        validator = Draft202012Validator(
+            schemas[PREFIX + "semantic_decision_index"], registry=registry,
+            format_checker=FormatChecker(),
+        )
+        index_errors = list(validator.iter_errors(index))
+        if index_errors:
+            return [f"semantic decision index: {error.message}" for error in index_errors]
+        if index_bytes != rfc8785.dumps(index):
+            errors.append("semantic decision index is not canonical JCS")
+        binding = evidence["binding"]
+        candidate = binding["candidate"]
+        for field, expected in (
+            ("workspace_id", binding["workspace_id"]), ("run_id", binding["run_id"]),
+            ("repo_id", candidate["repo_id"]), ("target_ref", candidate["target_ref"]),
+            ("base_commit", candidate["expected_base"]),
+            ("candidate_commit", candidate["candidate_commit"]),
+        ):
+            if index[field] != expected:
+                errors.append(f"semantic decision index binding mismatch: {field}")
+        for prefix in ("base", "candidate"):
+            key = prefix + "_decisions"
+            count = index[prefix + "_decision_count"]
+            refs = index[key]
+            ids = [reference["artifact_id"] for reference in refs]
+            if count != len(refs):
+                errors.append(f"{key} count does not match registry manifest")
+            if ids != sorted(ids, key=lambda value: value.encode("utf-16-be")):
+                errors.append(f"{key} must be UTF-16 sorted")
+            for reference in refs:
+                content = artifacts.get((reference["artifact_id"], reference["version"]))
+                if content is None or "sha256:" + hashlib.sha256(content).hexdigest() != reference["checksum"]:
+                    errors.append(f"{key} artifact version/checksum unavailable or changed")
+        expected_refs = [
+            *({"role": "base", "artifact_ref": ref} for ref in index["base_decisions"]),
+            *({"role": "candidate", "artifact_ref": ref} for ref in index["candidate_decisions"]),
+        ]
+        actual_refs = evidence.get("decision_refs", [])
+        actual_ids = [entry["artifact_ref"]["artifact_id"] for entry in actual_refs]
+        if actual_refs != expected_refs:
+            errors.append("semantic decision refs differ from trusted exact-version index")
+        if actual_ids != sorted(actual_ids, key=lambda value: value.encode("utf-16-be")):
+            errors.append("semantic decision refs must be UTF-16 sorted")
+        if "findings_ref" in evidence:
+            reference = evidence["findings_ref"]
+            content = artifacts.get((reference["artifact_id"], reference["version"]))
+            if content is None or "sha256:" + hashlib.sha256(content).hexdigest() != reference["checksum"]:
+                errors.append("semantic findings version/checksum unavailable or changed")
+        if current is not None:
+            fields = ("semantic_recipe_hash", "decision_index_ref", "decision_refs", "findings_ref")
+            if any(evidence.get(field) != current.get(field) for field in fields):
+                errors.append("live semantic recipe/decision manifest changed")
+    except (ValueError, TypeError, UnicodeError, KeyError) as error:
+        errors.append(f"semantic input serialization: {error}")
+    return errors
+
+
 def approval_errors(
     request: dict[str, Any],
     artifacts: dict[tuple[str, int], bytes],
@@ -127,6 +205,7 @@ def approval_errors(
     status: str = "pending",
     now: str | None = None,
     contract_current: bool = True,
+    current_semantic: dict[str, Any] | None = None,
 ) -> list[str]:
     """Reference snapshot predicate over fixtures, not an execution/CAS engine."""
     errors = boundary_errors(request, schemas, {"approval.requested": "approval_requested"}, registry)
@@ -204,8 +283,12 @@ def approval_errors(
                 "workspace_id", "run_id", "task_id", "policy_hash", "contract_hash",
             )}
             binding["candidate"] = candidate
-            for kind, result in (("gate", "pass"), ("review", "approve")):
-                evidence_ref = snapshot["inputs"][kind + "_evidence"]
+            for kind, input_key, result in (
+                ("semantic_rebase", "semantic_evidence", "pass"),
+                ("gate", "gate_evidence", "pass"),
+                ("review", "review_evidence", "approve"),
+            ):
+                evidence_ref = snapshot["inputs"][input_key]
                 evidence_bytes = artifacts.get((evidence_ref["artifact_id"], evidence_ref["version"]))
                 if evidence_bytes is None:
                     errors.append(f"{kind} artifact version unavailable")
@@ -225,6 +308,10 @@ def approval_errors(
                     errors.append(f"{kind} candidate/context mismatch")
                 if evidence["kind"] != kind or evidence["result"] != result:
                     errors.append(f"{kind} evidence not accepted")
+                if kind == "semantic_rebase":
+                    errors.extend(semantic_input_errors(
+                        evidence, artifacts, schemas, registry, current=current_semantic,
+                    ))
     except (ValueError, TypeError, UnicodeError) as error:
         errors.append(f"approval serialization: {error}")
     return errors
@@ -346,7 +433,10 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
         check("probes_runnable", False, "missing schema dependencies or fixture examples")
     approval_fixtures = {
         "approval_budget", "approval_merge", "approval_tool",
-        "approval_hash_vectors", "merge_gate", "merge_review",
+        "approval_batch", "approval_hash_vectors", "merge_semantic_rebase", "merge_gate", "merge_review",
+        "semantic_decision_base", "semantic_decision_candidate", "semantic_decision_index",
+        "approval_batch_item_receipt_granted", "approval_batch_item_receipt_skipped",
+        "merge_receipt", "semantic_arbitration_decision", "semantic_conflict_evidence",
     }
     check("approval_fixtures_present", approval_fixtures <= fixtures.keys())
     if dependencies_ok and approval_fixtures <= fixtures.keys():
@@ -358,9 +448,9 @@ def audit(root: Path, baseline_ref: str | None) -> dict[str, Any]:
         check("approval_probes_runnable", False, "missing schema dependencies or approval fixtures")
     merge_flow = canonical.split("### Serial Merge: Final Candidate Binding")[-1].split("### Output besar")[0]
     markers = [
-        "2. Rebase branch task", "4. Freeze candidate", "5. Gate build/lint/test",
-        "6. review.requested/completed", "7. Persist snapshot JCS",
-        "8. Tepat sebelum integrasi", "9. Verifikasi candidate_commit",
+        "2. Rebase branch task", "5. Gate build/lint/test", "6. Semantic Rebase PASS",
+        "7. review.requested/completed", "8. Persist snapshot JCS",
+        "9. Tepat sebelum integrasi", "10. Verifikasi candidate_commit",
     ]
     positions = [merge_flow.find(marker) for marker in markers]
     check("documented_merge_order", all(position >= 0 for position in positions) and positions == sorted(positions))
@@ -506,8 +596,64 @@ def approval_probes(
     fixtures: dict[str, dict[str, Any]], check: Any,
 ) -> None:
     valid_fixtures = True
-    vector_names = {"approval_budget", "approval_merge", "approval_tool", "merge_gate", "merge_review"}
+    vector_names = {
+        "approval_budget", "approval_merge", "approval_tool",
+        "merge_semantic_rebase", "merge_gate", "merge_review",
+    }
     check("fixture_hash_vectors_complete", fixtures["approval_hash_vectors"].keys() == vector_names)
+    batch_validator = Draft202012Validator(
+        schemas[PREFIX + "approval_batch"], registry=registry, format_checker=FormatChecker(),
+    )
+    batch = fixtures["approval_batch"]
+    check("fixture_schema:approval_batch", batch_validator.is_valid(batch))
+    operational_fixture_schemas = {
+        "approval_batch_item_receipt_granted": "approval_batch_item_receipt",
+        "approval_batch_item_receipt_skipped": "approval_batch_item_receipt",
+        "merge_receipt": "merge_receipt",
+        "semantic_arbitration_decision": "semantic_arbitration_decision",
+        "semantic_conflict_evidence": "merge_evidence",
+        "semantic_decision_index": "semantic_decision_index",
+    }
+    for fixture_name, schema_name in operational_fixture_schemas.items():
+        valid = Draft202012Validator(
+            schemas[PREFIX + schema_name], registry=registry, format_checker=FormatChecker(),
+        ).is_valid(fixtures[fixture_name])
+        check(f"fixture_schema:{fixture_name}", valid)
+        valid_fixtures = valid_fixtures and valid
+    batch_items = batch.get("items", [])
+    batch_ids = [item.get("approval_id") for item in batch_items]
+    check(
+        "approval_batch_items_unique_sorted",
+        len(batch_ids) == len(set(batch_ids)) and batch_ids == sorted(batch_ids, key=lambda value: value.encode("utf-16-be")),
+    )
+    check("approval_batch_item_hash_bindings", all(
+        item.get("snapshot_ref", {}).get("checksum") == item.get("bound_hash")
+        for item in batch_items
+    ))
+    batch_submissions = [event for name, event in examples if name == "approval.batch_submitted"]
+    check("approval_batch_submission_example_present", bool(batch_submissions))
+    for event in batch_submissions:
+        reference = event["payload"]["batch_ref"]
+        digest_requests = {
+            request["payload"]["approval_id"]: request
+            for name, request in examples
+            if name == "approval.requested"
+            and request["payload"].get("risk") == "high"
+            and request["payload"].get("delivery_mode") == "digest"
+        }
+        check(
+            "approval_batch_example_manifest_binding",
+            snapshot_digest(batch) == event["payload"]["batch_hash"] == reference["checksum"]
+            and batch["workspace_id"] == event["workspace_id"]
+            and batch["run_id"] == event["run_id"]
+            and all(
+                item["approval_id"] in digest_requests
+                and item["bound_hash"] == digest_requests[item["approval_id"]]["payload"]["bound_hash"]
+                and item["snapshot_ref"] == digest_requests[item["approval_id"]]["payload"]["snapshot_ref"]
+                and item["task_id"] == digest_requests[item["approval_id"]].get("task_id")
+                for item in batch_items
+            ),
+        )
     for name in sorted(vector_names):
         schema_name = "approval_snapshot" if name.startswith("approval_") else "merge_evidence"
         valid = Draft202012Validator(
@@ -543,13 +689,120 @@ def approval_probes(
     if not {"budget.increase", "git.merge"} <= requests.keys() or not grants:
         return
     artifacts: dict[tuple[str, int], bytes] = {}
-    for action, name in (("budget.increase", "approval_budget"), ("git.merge", "approval_merge")):
+    for action, name in (
+        ("budget.increase", "approval_budget"),
+        ("git.merge", "approval_merge"),
+        ("tool.execute", "approval_tool"),
+    ):
         reference = requests[action]["payload"]["snapshot_ref"]
         artifacts[(reference["artifact_id"], reference["version"])] = rfc8785.dumps(fixtures[name])
     merge = fixtures["approval_merge"]
-    for kind in ("gate", "review"):
-        reference = merge["inputs"][kind + "_evidence"]
+    for kind, input_key in (
+        ("semantic_rebase", "semantic_evidence"),
+        ("gate", "gate_evidence"),
+        ("review", "review_evidence"),
+    ):
+        reference = merge["inputs"][input_key]
         artifacts[(reference["artifact_id"], reference["version"])] = rfc8785.dumps(fixtures["merge_" + kind])
+    decision_fixtures = {
+        "base": "semantic_decision_base",
+        "candidate": "semantic_decision_candidate",
+    }
+    for decision_ref in fixtures["merge_semantic_rebase"]["decision_refs"]:
+        reference = decision_ref["artifact_ref"]
+        decision_fixture = fixtures[decision_fixtures[decision_ref["role"]]]
+        artifacts[(reference["artifact_id"], reference["version"])] = rfc8785.dumps(decision_fixture)
+    decision_index_ref = fixtures["merge_semantic_rebase"]["decision_index_ref"]
+    decision_index_bytes = rfc8785.dumps(fixtures["semantic_decision_index"])
+    artifacts[(decision_index_ref["artifact_id"], decision_index_ref["version"])] = decision_index_bytes
+    check(
+        "semantic_decision_index_fixture_checksum",
+        "sha256:" + hashlib.sha256(decision_index_bytes).hexdigest() == decision_index_ref["checksum"],
+    )
+
+    receipt = fixtures["merge_receipt"]
+    candidate = merge["inputs"]["candidate"]
+    merge_request = requests["git.merge"]["payload"]
+    check(
+        "merge_receipt_matches_approval_and_evidence",
+        receipt["workspace_id"] == merge["workspace_id"]
+        and receipt["run_id"] == merge["run_id"]
+        and receipt["task_id"] == merge["task_id"]
+        and receipt["repo_id"] == candidate["repo_id"]
+        and receipt["target_ref"] == candidate["target_ref"]
+        and receipt["expected_base"] == candidate["expected_base"]
+        and receipt["merged_commit"] == candidate["candidate_commit"]
+        and receipt["merged_tree"] == candidate["candidate_tree"]
+        and receipt["approval"]["approval_id"] == merge_request["approval_id"]
+        and receipt["approval"]["bound_hash"] == merge_request["bound_hash"]
+        and receipt["approval"]["snapshot_ref"] == merge_request["snapshot_ref"]
+        and all(receipt[key] == merge["inputs"][key] for key in (
+            "semantic_evidence", "gate_evidence", "review_evidence",
+        )),
+    )
+    arbitration = fixtures["semantic_arbitration_decision"]
+    semantic = fixtures["semantic_conflict_evidence"]
+    decision_refs = [item["artifact_ref"] for item in semantic["decision_refs"]]
+    conflict_events = [event for name, event in examples if name == "task.semantic_conflict"]
+    check(
+        "arbitration_decision_matches_semantic_evidence",
+        bool(conflict_events)
+        and semantic["result"] == "conflict"
+        and arbitration["workspace_id"] == semantic["binding"]["workspace_id"]
+        and arbitration["run_id"] == semantic["binding"]["run_id"]
+        and arbitration["task_id"] == semantic["binding"]["task_id"]
+        and arbitration["semantic_evidence"] == conflict_events[0]["payload"]["semantic_evidence"]
+        and conflict_events[0]["payload"]["semantic_evidence"] == conflict_events[0]["payload"]["blocked_evidence"]
+        and all(reference in decision_refs for reference in arbitration["selected_decision_refs"])
+        and conflict_events[0]["payload"]["decision_refs"] == semantic["decision_refs"],
+    )
+    conflict_decision_fixtures = {
+        "base": fixtures["semantic_decision_base"],
+        "candidate": fixtures["semantic_decision_candidate"],
+    }
+    check("semantic_conflict_decision_checksums", all(
+        "sha256:" + hashlib.sha256(rfc8785.dumps(conflict_decision_fixtures[item["role"]])).hexdigest()
+        == item["artifact_ref"]["checksum"]
+        for item in semantic["decision_refs"]
+    ))
+    # Memory admission receipt validation: receipt must match approval/grant event ID,
+    # bound hash, semantic evidence and candidate merged; validated before expiry.
+    # Receipt mock is not guarantee of W06 completion.
+    admission_check = (
+        receipt["approval"]["bound_hash"] == merge_request["bound_hash"]
+        and receipt["approval"]["approval_id"] == merge_request["approval_id"]
+        and receipt["semantic_evidence"] == merge["inputs"]["semantic_evidence"]
+        and receipt["merged_commit"] == candidate["candidate_commit"]
+        and receipt["merged_tree"] == candidate["candidate_tree"]
+        and receipt["confirmed"] is True
+    )
+    check("memory_admission_receipt_validates_approval_and_merge", admission_check)
+    # Check that receipt grant_event_id is present and valid format
+    check("memory_admission_receipt_has_grant_event_id", bool(receipt["approval"].get("grant_event_id")))
+    # Check that receipt validation would fail if expiry is past
+    if grants and grants[0].get("expires_at"):
+        expired_receipt = deepcopy(receipt)
+        expired_receipt["confirmed_at"] = "2026-10-06T09:30:00Z"
+        expired_receipt["validated_at"] = "2026-10-06T09:20:00Z"
+        expiry = datetime.fromisoformat(grants[0]["expires_at"].replace("Z", "+00:00"))
+        confirmed = datetime.fromisoformat(expired_receipt["confirmed_at"].replace("Z", "+00:00"))
+        admission_expiry_check = confirmed >= expiry
+        check("memory_admission_receipt_fails_after_expiry", admission_expiry_check)
+    else:
+        check("memory_admission_receipt_expiry_check_skipped", True)
+    batch_payload = batch_submissions[0]["payload"]
+    granted_receipt = fixtures["approval_batch_item_receipt_granted"]
+    batch_item = next(item for item in batch_items if item["approval_id"] == granted_receipt["approval_id"])
+    check(
+        "batch_item_receipt_matches_manifest",
+        granted_receipt["workspace_id"] == batch["workspace_id"]
+        and granted_receipt["run_id"] == batch["run_id"]
+        and granted_receipt["batch_hash"] == batch_payload["batch_hash"]
+        and granted_receipt["batch_ref"] == batch_payload["batch_ref"]
+        and granted_receipt["bound_hash"] == batch_item["bound_hash"]
+        and granted_receipt["outcome"] == "granted"
+        and granted_receipt["scope"] == "once",
+    )
 
     def request_for(snapshot: dict, template: dict, artifact_id: str) -> dict:
         request = deepcopy(template)

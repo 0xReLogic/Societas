@@ -108,8 +108,11 @@ Emit event
 
 Dilarang ada blocking goroutine pada channel (mis. `<-approvalCh`) saat menunggu Human Approval.
 
-- Saat task butuh approval, task menyimpan state terkini ke SQLite (`status: awaiting_approval`), melepas alokasi CPU/goroutine, dan me-return worker ke pool — aman saat restart/crash.
-- Saat human klik Approve di dashboard, Go runtime mengeksekusi **Compare-And-Swap (CAS)** di SQLite (`status: ready`) dan menjadwalkan ulang task ke worker pool.
+- Saat task butuh approval `immediate` atau `digest`, status terkini dan relasi ke record approval dipersist ke SQLite (`status: awaiting_approval`, delivery mode/approval ID tersimpan), lalu CPU/goroutine/RAM dilepas dan worker kembali ke pool — aman saat restart/crash.
+- Checkpoint, request/snapshot refs, expiry, dan digest membership tetap di SQLite; jangan mempertahankan prompt working set/KV cache per task hanya karena parked. Worktree/artifact persisten untuk resume, bukan RAM. Call in-flight disettle/di-account, tidak dimatikan diam-diam; jangan membawa checkpoint mutable task A sebagai context task B.
+- Item digest menunggu tanpa worker, goroutine, lock antrean, atau alokasi resource task aktif. Orchestrator bebas memberi agen yang sama backlog independen yang lolos dependency, permission, budget, dan concurrency guard. Agent logical dapat berganti ke `idle`/task lain; UI memisahkan parked task dari aktivitas agen.
+- Grant tervalidasi menjalankan **Compare-And-Swap (CAS)** SQLite (`status: ready`) per task/approval dan menjadwalkannya ulang. Satu klik batch menghasilkan transisi terpisah per item; satu kegagalan tidak membatalkan grant valid lainnya.
+- `risk_tier: critical` tidak eligible digest: policy menghentikan mutasi/dependency yang terdampak dan meminta `immediate` approval saat itu juga. Tidak ada jalur batch yang dapat melanjutkan aksi critical.
 - Model yang sama berlaku untuk parkir lain (`paused`, `interrupted`) — worker tidak pernah idle-menunggu.
 
 Pause kooperatif memakai `task.paused` dengan fase requested/completed (72A.8/72A.12). Task menyimpan `pause_deadline` absolut; startup mengubah `running` **dan `pausing`** menjadi `interrupted` lewat event `task.interrupted` tanpa menghilangkan deadline. Recovery/resume tetap memakai CAS. Call tool yang mungkin sudah berjalan tidak boleh diulang otomatis kecuali aman menurut I16; cancel/TTL tidak menghapus kewajiban accounting (72A.6).
@@ -120,7 +123,7 @@ Request approval mengikat `ApprovalSnapshot` berversi: `bound_hash = "sha256:" +
 
 Runtime mengecek ulang binding pada grant, resume, dan tepat sebelum dispatch: input aktual, expiry, policy/contract, dan evidence. Perubahan → `approval.invalidated`, request baru memakai ID baru. Refresh task `awaiting_approval -> ready` bukan izin mutasi. Scope once/task/run tidak membebaskan pemeriksaan hash; predicate reuse/once-consumption masih keputusan terpisah.
 
-Untuk merge, snapshot mengikat base, commit/tree kandidat final, recipe gate, dan artifact versi gate/review. Urutan wajib: rebase/resolve → freeze kandidat → gate → review → approval → final recheck + expected-base CAS (#60.4, 72A.10). Jangan membuat commit baru sesudah approval. Lock serial hanya di final check/update, tidak dipegang saat menunggu human. Git-ref CAS tidak menjamin transaksi Git+SQLite; intent/receipt recovery (W06) dan shared metadata isolation (W14) masih perlu keputusan.
+Untuk merge, snapshot mengikat expected base, candidate commit/tree, PROJECT_MAP, gate recipe, semantic recipe/decision refs, policy/contract, serta artifact-version/checksum gate + semantic + review evidence. Urutan wajib: rebase/resolve → freeze kandidat → gate → Semantic Rebase `PASS` → review → approval → final recheck + expected-base CAS (#60.4, 72A.10). Jangan membuat commit atau verdict semantic baru sesudah approval; final executor hanya merevalidasi evidence/input terikat. Lock serial hanya di final check/update, tidak dipegang saat menunggu human. Git-ref CAS tidak menjamin transaksi Git+SQLite; intent/receipt recovery (W06) dan shared metadata isolation (W14) masih perlu keputusan.
 
 ---
 
@@ -138,6 +141,9 @@ Orchestrator bertugas:
 - escalation
 - approval
 - aggregation
+- semantic rebase triage dan routing conflict/inconclusive ke `escalation_lead`
+- durable receipt validation untuk approval batch per item dan konfirmasi merge receipt sebelum memory admission
+- confirmed merge receipt dan exact evidence refs menjadi provenance admission ke Cognitive Store; task terminal/lead verdict saja tidak cukup
 
 Catatan:
 
@@ -292,7 +298,7 @@ Security -------/
 
 Orchestrator harus mengontrol concurrency.
 
-Eksekusi boleh paralel, tapi **merge ke `main` diserialkan**: rebase/resolve → freeze kandidat final → gate → review → approval → final recheck + expected-base CAS (I17, 72A.10, **60.4 Serial Merge Queue**). Conflict dikembalikan ke Engineer; perubahan base/kandidat membatalkan evidence dan approval lama.
+Eksekusi boleh paralel, tapi **merge ke `main` diserialkan**: rebase/resolve → freeze candidate → gate → Semantic Rebase → review → approval → final evidence recheck + expected-base CAS (I17/I19, 72A.10, **60.4 Serial Merge Queue**). Text conflict dikembalikan ke Engineer; semantic conflict/inconclusive diparkir ke escalation_lead; perubahan base/kandidat membatalkan evidence dan approval lama.
 
 ---
 
@@ -361,6 +367,14 @@ Template prompt agen bawahan wajib memuat klausul otoritas:
 Putusan {{ .EscalationLead }} yang diterbitkan dalam `decision.md` bersifat final dan mengikat.
 Agen dilarang membuka kembali atau memperdebatkan putusan tersebut; wajib langsung mengeksekusi instruksi.
 ```
+
+## 48.5 Semantic Conflict Arbitration
+
+Semantic Rebase adalah gate pre-approval terpisah dari rebuttal Reviewer. `CONFLICT` segera memblokir merge; tidak perlu memalsukan empat pesan rebuttal. `INCONCLUSIVE` (input tidak lengkap, timeout, budget habis, atau evaluator error) juga fail closed, bukan fallback ke PASS. Task tetap nonterminal dan diparkir dengan `blocked_reason` serta `blocked_evidence` artifact ref yang immutable; `task.semantic_conflict` mengikat ref tersebut, semantic evidence version/checksum, decision refs base/candidate, outcome, ringkasan, dan lead.
+
+Handoff menuju `escalation_lead` yang dikonfigurasi, mis. CTO untuk Engineer/Reviewer—bukan eskalasi wajib ke CEO. Sertakan refs evidence, base/candidate/diff, findings/recipe, serta transkrip hanya bila memang ada debat. Ringkasan murah opsional harus menunjuk evidence penuh dan tidak masuk Vector DB.
+
+Lead menerbitkan artifact `decision.md` terstruktur: semantic evidence ref, versi keputusan terpilih, refactor task IDs, rationale, dan acceptance constraints. Putusan mengarahkan pekerjaan, **bukan izin bypass** policy/sandbox/critical approval. Orchestrator memvalidasi lead dan binding/input yang masih current sebelum unblock via CAS. Task pendekatan kalah melakukan refactor asinkron pada task nonterminal/worktree; bila dua sisi berubah, keduanya mendapat task. Task terminal tidak dibuka ulang. Candidate kembali melalui rebase → gate → Semantic Rebase `PASS` → review → approval baru. Budget/retry membatasi loop; putusan yang inputnya berubah tidak berlaku otomatis. Durability receipt/auth lintas subsistem tetap W06, bukan klaim sudah terimplementasi.
 
 ---
 

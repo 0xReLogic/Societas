@@ -124,14 +124,19 @@ Artifacts
 
 ## 33.7 Approval Center
 
-Semua action yang membutuhkan human approval.
+Approval Center memiliki dua jalur perhatian. Critical tampil seketika sebagai interupsi yang menghentikan aksi (`synchronous halt`); high-risk masuk antrean Digest Mode dan tidak memunculkan interupsi satu per satu.
+
+Summary Manager mengumpulkan request high-risk yang eligible dan menampilkan kartu agregat per workspace/run saat interval terkonfigurasi atau akhir siklus. `max_items_per_card` memecah manifest besar menjadi beberapa kartu; overflow tidak di-approve otomatis. Setiap manifest `approval_batch/1` adalah artifact JCS immutable dan kartu menunjuk versi/hash yang dilihat; item baru tidak ikut klik lama. Baris memuat task, aksi/target/dampak, risk, expiry, base/kandidat, evidence, dan status valid/stale. **Inspect items** membuka item untuk approve/reject individual; **Approve All Validated** menjalankan validasi batch. Penjelasan LLM hanya teks bantu, bukan daftar otoritatif.
+
+Klik mengirim `approval.batch_submitted` dengan manifest `batch_hash`/`batch_ref`. Backend memvalidasi actor, envelope, identity, JCS, schema, checksum, urutan serta uniqueness approval IDs. Manifest tak valid ditolak seluruhnya tanpa grant. Setelah manifest valid, tiap item menjalani revalidasi terpisah; item valid menghasilkan grant `scope: once` dengan ID/hash aslinya dan durable per-item processing receipt; item lain menampilkan `skipped` beserta alasan. User tetap dapat inspect, approve, atau reject satu item tanpa menyetujui manifest penuh. Hasil boleh parsial. Batch tidak menyetujui critical, tidak menggabungkan otorisasi, dan tidak melewati pemeriksaan final dispatch atau expected-base CAS.
 
 ```text
-3 approvals pending
+Digest: 3 high-risk approvals pending
 
-[Deploy staging]
-[Run migration]
-[Modify config]
+[Approve All Validated]
+Deploy staging       Validated
+Update dependencies  Validated
+Modify API route     Revalidation required
 ```
 
 ---
@@ -207,21 +212,41 @@ toolchain:
       parser: "raw_tail"
 
 risk:
+  approval_delivery:
+    critical: immediate
+    high_mode: digest
+    default: immediate
+  digest_interval_seconds: 900
+  notify_on_cycle_end: true
+  max_items_per_card: 20
   path_patterns:
     critical:
       - "migrations/**"
       - "infra/**"
       - "contracts/**"
+      - "src/consensus/**"
     high:
       - "src/auth/**"
+      - "src/api/**"
+      - "scripts/cache-cleanup/**"
+      - "Cargo.toml"
+      - "package*.json"
+      - "go.mod"
   intent_keywords:
     critical:
       - "drop database"
+      - "force push"
+      - "break consensus"
       - "payout"
+      - "transfer funds"
     high:
-      - "deploy"
-      - "secret"
+      - "modify api route"
+      - "update dependencies"
+      - "cleanup cache"
+      - "isolated shell script"
 ```
+
+    `approval_delivery` mengatur jalur notifikasi, bukan permission, approval, atau expiry. Jika tidak dikonfigurasi, gunakan `immediate`; konfigurasi invalid ditolak, jangan memakai fallback yang melonggarkan policy. Saat `high_mode: digest`, `digest_interval_seconds` dan `max_items_per_card` wajib finite dan positif. Batas item memecah kartu, bukan auto-grant overflow. Akhir siklus berarti scheduler quiescent tanpa task runnable; task yang parked tidak membuat sistem menunggu hingga terminal. Persist waktu/membership notifikasi untuk restart. Critical selalu immediate dan tidak dapat diturunkan lewat setting; path/intent high tetap tunduk pada klasifikasi critical.
 
 ---
 
@@ -240,6 +265,10 @@ events      (append-only event log)
 messages
 run history
 approvals
+approval batch manifests (immutable artifact refs)
+approval batch item receipts (idempotency/recovery key per batch + approval ID)
+confirmed merge receipts (approval/evidence/Git ref binding)
+semantic evidence and decision artifact refs/checksums (Operational Store indexes)
 artifact metadata
 memory (entry terstruktur)
 usage / akumulasi budget
@@ -249,15 +278,15 @@ File artifacts tetap disimpan sebagai files. Database hanya menyimpan metadata.
 
 ## 37.2 Cognitive Store — Embedded Vector DB
 
-Menyimpan representasi semantik, bukan data operasional:
+Menyimpan representasi semantik yang sudah lolos admission guard #19.6, bukan data operasional:
 
 ```text
-embedding artifact (artifact.created)
-ringkasan riset
-koordinat semantik memory masa lalu
+approved decision/spec yang semantic-pass dan merge-receipt-confirmed
+ringkasan dari sumber eligible yang sama
+koordinat semantik memory eligible yang masih fresh
 ```
 
-Implementasi: embedded vector DB seperti **ChromaDB** atau **`sqlite-vec`**, agar tetap local-first tanpa server eksternal. Embedding dihasilkan oleh model embedding lokal yang ringan — bukan model chat utama.
+`artifact.created` hanya mencatat persistence, bukan trigger embedding. Approval snapshot + semantic evidence + confirmed merge receipt harus cocok dan freshness/supersede guard lulus sebelum cognitive admission (I19/72A.10). Implementasi: embedded vector DB seperti **ChromaDB** atau **`sqlite-vec`**, agar tetap local-first tanpa server eksternal. Embedding dihasilkan oleh model embedding lokal yang ringan — bukan model chat utama.
 
 ## 37.3 Pemisahan Tanggung Jawab
 
@@ -265,5 +294,6 @@ Implementasi: embedded vector DB seperti **ChromaDB** atau **`sqlite-vec`**, aga
 - SQLite tidak pernah dipakai untuk pencarian teks mentah atau `LIKE`.
 - Vector DB tidak pernah dipakai untuk relasi data, status, atau ledger — itu tanggung jawab SQLite.
 - ID hasil retrieval Vector DB **wajib di-validasi ulang ke SQLite** sebelum masuk context: yang `superseded` atau `stale` dibuang (#19.6 Memory Curation).
+- Admission mengecek sumber Operational Store: approval snapshot/hash, semantic evidence ref, confirmed merge receipt, serta status freshness/supersede yang mengikat workspace/run/task/candidate sama. Artifact belum admitted atau masih quarantine tidak boleh diretrieve meskipun vector row tertinggal.
 
 ---
