@@ -284,6 +284,8 @@ Security -------/
 
 Orchestrator harus mengontrol concurrency.
 
+Eksekusi boleh paralel, tapi **merge ke `main` diserialkan**: setiap branch task otomatis di-rebase ke `main` terkini sebelum diajukan approval; conflict dikembalikan ke Engineer untuk resolve (lihat **60.4 Serial Merge Queue**).
+
 ---
 
 # 46. Priority

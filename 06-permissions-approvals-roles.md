@@ -200,6 +200,8 @@ Engineer tidak otomatis boleh melakukan deployment production.
 
 Output kode Engineer selalu melewati **Deterministic Toolchain Runner** (pipeline build/lint/test lokal, 0 token, fail-fast) sebelum diserahkan ke Reviewer (lihat 5A.21, #29, `toolchain` di #36).
 
+Mekanisme penulisan kode ke worktree memakai **Search & Replace Block** (#60.3) — Engineer tidak menulis ulang seluruh file dan tidak mengarang header unified diff. Sebelum approval, branch task otomatis di-rebase ke `main` oleh Serial Merge Queue (#60.4) — conflict dikembalikan ke Engineer untuk resolve, bukan ke user.
+
 Untuk integrasi kontrak/API, Engineer mengikuti alur **Contract-First** (#17.1): codegen binding otomatis + `contract.lookup`, bukan menulis call manual.
 
 ---
