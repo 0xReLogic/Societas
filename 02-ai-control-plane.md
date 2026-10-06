@@ -727,6 +727,8 @@ Ignore:
 - unrelated agent conversations
 ```
 
+ID hasil retrieval difilter deterministik di Go sebelum masuk context budget: memori yang `superseded` atau `stale` dibuang, dan skor dipengaruhi faktor umur (time-decay) — lihat **#19.6 Memory Curation**.
+
 ## 5A.25 Token Visibility
 
 Dashboard **tidak melakukan fetch eksternal ke provider secara live** untuk merender grafik biaya — semua angka dibaca dari SQLite sebagai Single Source of Truth (#32.1), sesuai prinsip Local-First.

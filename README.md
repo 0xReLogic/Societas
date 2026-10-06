@@ -44,3 +44,4 @@ jadi referensi silang (`#48`, `5A.8`, `72A.5`, `I3`, dst) tetap valid antar-doku
 - Search & Replace Edit + Serial Merge Queue: Doc 09 (§60.3–60.4), Doc 06 (§28), Doc 08 (§45)
 - PROJECT_MAP auto-regen: Doc 03 (§7.1), Doc 09 (§60.4)
 - Provider Rate Limiter (RPM/TPM token bucket): Doc 02 (5A.8)
+- Memory Curation / anti Zombie Memory: Doc 05 (§19.6, §20), Doc 07 (§37.3), Doc 02 (5A.24)

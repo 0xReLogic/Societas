@@ -131,6 +131,19 @@ Setiap level memory di atas di-map ke pilar penyimpanan:
 
 Retrieval semantik selalu melewati Vector DB dan mengembalikan ID referensi (5A.24) — bukan pencarian teks mentah di SQLite.
 
+## 19.6 Memory Curation (Anti Semantic Drift / Zombie Memory)
+
+Vector DB bekerja berdasarkan kemiripan teks (cosine similarity), **bukan status kebenaran atau recency**. Ia tidak tahu dokumen mana yang sudah basi — `architecture_v1.md` (nullifier 2 status) dan `nullifier_v2.md` (4 status) bisa sama-sama ter-retrieve karena kemiripannya hampir sama, sehingga agen menerima dua fakta kontradiktif dan bisa "ketularan" keputusan lama yang sudah dibatalkan. Semakin tua proyek, makin banyak zombie memory: keputusan dibatalkan, bug log yang sudah di-patch, nama fungsi yang sudah deprecated.
+
+Empat aturan kurasi deterministik di Go + SQLite — tanpa algoritma AI tambahan:
+
+1. **Filter pintu masuk — jangan embed semua hal.** Yang boleh di-embed ke Cognitive Store hanya `decision.md` yang sudah di-approve manusia dan dokumentasi final yang kodenya sudah di-merge ke `main`. Dilarang di-embed: chat/debat antar-agen, log error terminal & test gagal, draft yang belum di-approve.
+2. **Pola Supersede (tombstone di SQLite).** Tabel `artifacts` memiliki kolom `superseded_by` (ID artifact pengganti). Saat keputusan baru menggantikan yang lama, record lama ditandai — bukan dihapus. Setiap ID hasil retrieval Vector DB wajib di-filter ulang ke SQLite: `superseded_by != NULL -> skip`. Dokumen basi tidak pernah masuk context LLM lagi.
+3. **Time-decay scoring.** Skor akhir retrieval = `vector_similarity x faktor_umur` (mis. dokumen minggu ini x1.0, 3 bulan x0.5), dihitung deterministik di Go — dokumen lama yang kebetulan mirip kalah dari dokumen baru yang relevan.
+4. **Ikat memori ke git commit / path.** Setiap entry memori menyimpan metadata `source_path` (mis. `crates/storage/src/nullifier.rs`) dan commit hash. Background GC mengecek via git: jika file/fungsi sudah dihapus atau di-rename di `main`, memori ditandai `stale` dan dibersihkan dari Vector DB.
+
+Prinsip: Vector DB adalah **perpustakaan buku yang sudah lulus kurasi** — bukan tempat sampah. Edisi lama ditarik dari rak saat revisi terbit.
+
 ---
 
 # 20. Memory Rules
@@ -143,7 +156,7 @@ Memory harus memiliki:
 - scope
 - owner
 
-Jangan memasukkan semua chat ke memory secara otomatis.
+Jangan memasukkan semua chat ke memory secara otomatis — hanya keputusan ter-approve dan dokumentasi pasca-merge yang boleh di-embed (#19.6).
 
 Memory harus memiliki lifecycle.
 
@@ -160,6 +173,9 @@ validated memory
     |
     v
 persistent memory
+    |
+    v
+superseded / stale  (tombstone di SQLite — tidak pernah kembali ke context, #19.6)
 ```
 
 ---
