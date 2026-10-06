@@ -112,9 +112,11 @@ Dilarang ada blocking goroutine pada channel (mis. `<-approvalCh`) saat menunggu
 - Saat human klik Approve di dashboard, Go runtime mengeksekusi **Compare-And-Swap (CAS)** di SQLite (`status: ready`) dan menjadwalkan ulang task ke worker pool.
 - Model yang sama berlaku untuk parkir lain (`paused`, `interrupted`) — worker tidak pernah idle-menunggu.
 
+Pause kooperatif memakai `task.paused` dengan fase requested/completed (72A.8/72A.12). Task menyimpan `pause_deadline` absolut; startup mengubah `running` **dan `pausing`** menjadi `interrupted` lewat event `task.interrupted` tanpa menghilangkan deadline. Recovery/resume tetap memakai CAS. Call tool yang mungkin sudah berjalan tidak boleh diulang otomatis kecuali aman menurut I16; cancel/TTL tidak menghapus kewajiban accounting (72A.6).
+
 ## 40.2 Bound Hash Protection
 
-Request approval wajib mengikat `bound_hash` (commit SHA / migration hash saat request dibuat). Jika kode atau konfigurasi upstream berubah selama task diparkir, approval otomatis **invalid** — mencegah eksekusi perubahan usang.
+Request approval wajib mengikat `bound_hash`: digest SHA-256 dari snapshot input yang dilindungi, dengan format `sha256:` + 64 hex lowercase (72A.8), **bukan commit SHA Git mentah**. Jika input kode atau konfigurasi yang dilindungi berubah selama task diparkir, approval otomatis **invalid**. Pemilihan komponen snapshot dan encoding kanonik per aksi masih menunggu keputusan W03/W04; aturan ini belum merupakan protokol approval mutatif yang lengkap.
 
 ---
 
@@ -235,7 +237,7 @@ Contoh:
 
 ```text
 Network error
- -> retry
+ -> tool: outcome_unknown kecuali terbukti belum dispatch; periksa I16 sebelum retry
 
 Permission denied
  -> do not retry
@@ -244,10 +246,12 @@ Invalid tool input
  -> agent correction
 
 Model timeout
- -> bounded retry
+ -> bounded retry dengan guard/accounting; bukan asumsi call tanpa biaya
 ```
 
 Kategori di atas dipetakan ke kode error konkret di **Section 72A.9 (Error Catalog)**, termasuk status `retryable` dan aksi default. Semua retry dihitung dalam retry budget (5A.13).
+
+`error.retryable: true` tidak mengalahkan keamanan efek: timeout tool non-idempotent tanpa deduplikasi provider wajib rekonsiliasi atau keputusan human. Outcome kanonik `not_started`/`outcome_unknown` ada di 72A.8; gagal logis yang hasilnya diketahui memakai `tool.call_completed` `status: error`.
 
 ---
 

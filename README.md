@@ -26,7 +26,7 @@ jadi referensi silang (`#48`, `5A.8`, `72A.5`, `I3`, dst) tetap valid antar-doku
 | `07-dashboard-config-storage.md` | 33–37 | Dashboard (task board, approval center), workspace.yaml (risk, toolchain, escalation_lead), dual-storage SQLite + Vector DB |
 | `08-runtime-architecture.md` | 38–56 | Suggested architecture, module, agent runtime (step function), event bus (outbox, mailbox), retry, parallelism, conflict resolution (escalation_lead), voice/multimodal, channel taxonomy, backpressure, retention |
 | `09-security-sandbox-observability.md` | 57–72 | Security model, secrets, tool sandbox & OS-level isolation, git integration & worktree, MCP search, structured tool calls, observability/logging/tracing, agent run, replay, context budget, protocol versioning |
-| `10-contracts-mvp-roadmap.md` | 72A–105 | **Source of Truth**: invariants I1–I15, envelope, core schemas (task, artifact, budget), state machine, event registry, payload schemas, error catalog, alur baku, MVP, roadmap, priorities, killer demo, anti-boncos |
+| `10-contracts-mvp-roadmap.md` | 72A–105 | **Source of Truth**: invariants I1–I16, envelope, core schemas (task, artifact, budget), state machine, event registry, payload schemas, error catalog, alur baku, MVP, roadmap, priorities, killer demo, anti-boncos |
 
 ## Titik Panas Revisi Terakhir (quick lookup)
 
@@ -45,3 +45,19 @@ jadi referensi silang (`#48`, `5A.8`, `72A.5`, `I3`, dst) tetap valid antar-doku
 - PROJECT_MAP auto-regen: Doc 03 (§7.1), Doc 09 (§60.4)
 - Provider Rate Limiter (RPM/TPM token bucket): Doc 02 (5A.8)
 - Memory Curation / anti Zombie Memory: Doc 05 (§19.6, §20), Doc 07 (§37.3), Doc 02 (5A.24)
+- Review repair: tool outcome/retry (I16, §21, §44, 72A.8–10), pause recovery (72A.6), contract invalidation (§17.1, 72A.6/8), aggregate payload boundary (I5, 72A.12), semantic path guard (§22.2, §59)
+
+## Audit Kontrak
+
+Script audit asli yang dirujuk laporan review tidak disertakan. `audit-spec.py` adalah **pengganti transparan**, membaca schema/registry/contoh langsung dari §72A (tidak ada salinan schema kedua).
+
+```bash
+python3 -m venv .venv-audit
+.venv-audit/bin/pip install -r requirements-audit.txt
+.venv-audit/bin/python audit-spec.py --output validation-results.json
+.venv-audit/bin/python test-audit-spec.py
+# Opsional: periksa semua nomor heading lama tetap ada dan berurutan
+.venv-audit/bin/python audit-spec.py --baseline-ref <commit-sebelum-revisi>
+```
+
+Exit `0` = pemeriksaan statis lulus; exit `1` = kegagalan parse/schema/registry/contoh/probe/penomoran. Audit memeriksa sintaks JSON/YAML, Draft 2020-12, ID unik, `$ref`, registry, schema yatim, contoh kanonik, tabel transisi, serta probe boundary termasuk object nested dan UTF-8. Probe boundary adalah validator referensi spesifikasi, **bukan implementasi runtime**. YAML hanya diperiksa sintaksnya. Audit lulus tidak menutup celah desain atau membuktikan CAS, outbox, ledger, otorisasi, crash recovery, rekonsiliasi provider, Git broker, sandbox, atau memory GC — belum ada runtime di repo.

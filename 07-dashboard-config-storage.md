@@ -57,7 +57,7 @@ Done
 Setiap kartu task aktif memiliki tombol kontrol UI:
 
 ```text
-[ Pause ]   menjeda task (running -> paused)
+[ Pause ]   menjeda task (running -> pausing -> paused bila ada call in-flight)
 [ Resume ]  melanjutkan task dengan context terakhir (paused -> running)
 [ Cancel ]  membatalkan task permanen (-> cancelled)
 ```
@@ -65,6 +65,8 @@ Setiap kartu task aktif memiliki tombol kontrol UI:
 Klik tombol mengirim **sinyal deterministik ke backend Go (0 token LLM)**. Kontrol yang sama tersedia via command tag di CLI/chat — backend mengintersepsi `#TASK-xxx pause` / `#TASK-xxx resume` secara deterministik tanpa memanggil LLM router.
 
 Transisi yang diizinkan mengikuti state machine di 72A.6.
+
+Pause memakai `task.paused` `phase: requested` (human → Orchestrator); sesudah call settle, Orchestrator menerbitkan `phase: completed`. Resume divalidasi backend lalu `task.resumed` diterbitkan Orchestrator. Deadline absolut pause dipersist di Task/SQLite dan tetap berlaku setelah restart; `running`/`pausing` pulih lewat `task.interrupted`. Cancel/TTL tidak berarti efek call pasti belum terjadi (72A.6/72A.12).
 
 ---
 

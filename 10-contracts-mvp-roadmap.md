@@ -22,7 +22,7 @@ Aturan ini ditegakkan oleh runtime, bukan oleh prompt agent.
 | I2 | Agent hanya boleh **meminta** pembuatan task (`task.delegate_requested`). Hanya Orchestrator yang membuat dan meng-assign task. | Orchestrator |
 | I3 | Budget yang diberikan ke anak tidak boleh melebihi sisa budget parent. Total budget semua anak aktif tidak boleh melebihi sisa budget parent. | Budget Manager |
 | I4 | Tidak ada model call tanpa `budget.reserved` dan keputusan policy `allow`. Setiap model call harus di-settle (`budget.settled`) dengan usage nyata. | Token Guard (5A.15) |
-| I5 | Konten inline dibatasi (default: pesan 8.000 karakter, output tool 16.000 karakter). Yang lebih besar harus menjadi artifact + summary. | Event Bus |
+| I5 | Konten inline dibatasi atas **seluruh payload JSON terserialisasi**, termasuk semua field dan nested object, dalam byte UTF-8: default 8.000 byte untuk event selain `tool.call_completed`, dan 16.000 byte untuk `tool.call_completed`. Batas string pada schema tetap berlaku secara terpisah. Yang lebih besar harus menjadi artifact + summary. | Event Bus (guard di boundary sebelum persistence/delivery) |
 | I6 | Event bersifat immutable dan append-only. Event store memberi `seq` yang naik monoton per run. | Event Store |
 | I7 | `idempotency_key` yang sama dalam satu run diabaikan dan dijawab dengan hasil sebelumnya. | Event Bus |
 | I8 | Setiap event punya `correlation_id` (konstan per permintaan user) dan `causation_id` (event penyebab), kecuali event root (`run.created`). | Event Bus |
@@ -33,6 +33,7 @@ Aturan ini ditegakkan oleh runtime, bukan oleh prompt agent.
 | I13 | Setiap run diakhiri tepat satu `run.stopped` dengan `reason` yang jelas. | Orchestrator |
 | I14 | Agent tidak dapat mengubah budget, policy, atau limit miliknya sendiri. Hanya human (lewat approval) yang dapat menaikkannya. | Budget Manager + Policy Engine |
 | I15 | Event wajib ter-commit ke Event Store (SQLite) **sebelum** disalurkan ke subscriber (transactional outbox, #42.1). Tidak ada delivery dari memory saja. | Event Bus + Event Store |
+| I16 | Retry tool yang mungkin sudah berjalan hanya boleh jika tool dinyatakan `idempotent` di capability tepercaya (#21) atau request membawa `operation_key` stabil yang deduplikasinya ditegakkan provider tool. Kegagalan dengan hasil tidak diketahui (`outcome_unknown`) pada tool non-idempotent wajib rekonsiliasi atau keputusan human — tidak auto-retry. | Tool Runtime + Policy Engine |
 
 ## 72A.2 Identifier & Addressing
 
@@ -106,6 +107,7 @@ Catatan:
 - `protocol_version`, `message_type`, dan `schema_version` pada #72 dipetakan ke `protocol_version`, `type`, dan `schema_version`.
 - Frame transport pada #71 (`HELLO`, `AUTH`, `PUBLISH`, dst.) berada di bawah envelope ini. Envelope adalah isi dari frame `PUBLISH`, `TASK`, `MESSAGE`, dan `TOOL`.
 - `payload` divalidasi lagi terhadap schema sesuai `type` (lihat registry di 72A.7).
+- Ukuran payload terserialisasi agregat dibatasi (I5) — kelebihan wajib menjadi artifact. Schema saja tidak menegakkan batas byte nested object; aturan boundary di 72A.12 wajib dijalankan.
 
 ## 72A.4 Common Definitions
 
@@ -138,6 +140,8 @@ Catatan:
 }
 ```
 
+Label tampilan bukan nilai wire: `thinking` → tier `strong`; `PASS`/`PASS_WITH_WARNINGS` → verdict `approve` (warnings hanya advisory), `REQUEST_CHANGES` → `request_changes`. `reject` menolak hasil review tetapi tidak otomatis membuat task terminal. Label legacy `BLOCKED` belum punya mapping default: arti menunggu dependency/policy vs penolakan final harus diputuskan sebelum adapter memprosesnya (#29, keputusan I01).
+
 ## 72A.5 Core Objects
 
 ### Budget
@@ -166,6 +170,8 @@ Batas yang boleh diberikan ke workspace, run, task, atau agent. Semua field opsi
     "max_depth":           { "type": "integer", "minimum": 0 },
     "max_agent_iterations": { "type": "integer", "minimum": 0 },
     "max_task_iterations":  { "type": "integer", "minimum": 0 },
+    "max_rebuttals":       { "type": "integer", "minimum": 0,
+                             "description": "batas putaran sanggahan per task (#48); counter disimpan di SQLite dan bertahan atas retry/restart" },
     "retry": {
       "type": "object",
       "additionalProperties": false,
@@ -316,9 +322,23 @@ Bentuk lengkap task (memperluas #7).
                    "description": "Tag penyebab klasifikasi, mis. 'path:migrations/**', 'intent:deploy'." },
     "contract_hash": { "oneOf": [ { "$ref": "urn:societas:1:common#/$defs/sha256" }, { "type": "null" } ],
                        "description": "Pin SHA256 dari OpenAPI spec / Contract ABI untuk task contract-first (#17.1); task ditandai stale jika spec berubah." },
+    "contract_status": { "enum": ["current", "stale"], "default": "current",
+                         "description": "freshness kontrak terpisah dari status eksekusi; stale memblokir dispatch, review, approval, dan completion sampai re-pin + re-codegen (#17.1)" },
+    "pause_deadline": { "$ref": "urn:societas:1:common#/$defs/ts",
+                        "description": "deadline absolut pause yang dipersist; wajib saat pausing/paused dan tetap disimpan setelah interrupted sampai pause diselesaikan atau dibatalkan" },
     "created_at": { "$ref": "urn:societas:1:common#/$defs/ts" },
     "updated_at": { "$ref": "urn:societas:1:common#/$defs/ts" }
-  }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "enum": ["pausing", "paused"] } }, "required": ["status"] },
+      "then": { "required": ["pause_deadline"] }
+    },
+    {
+      "if": { "properties": { "contract_hash": { "type": "string" } }, "required": ["contract_hash"] },
+      "then": { "required": ["contract_status"] }
+    }
+  ]
 }
 ```
 
@@ -403,9 +423,9 @@ Status task:
 pending            dibuat, menunggu dependency atau scheduler
 ready              dependency selesai, budget sudah di-reserve, menunggu slot agent
 running            agent sedang bekerja
-pausing            transisi menuju paused; menunggu LLM call in-flight selesai (cooperative pause)
+pausing            transisi menuju paused; menunggu LLM/tool call in-flight selesai (cooperative pause)
 paused             dijeda oleh pengguna; context terakhir dipertahankan untuk resume
-interrupted        task berstatus running saat boot sistem; menunggu evaluasi Orchestrator
+interrupted        task berstatus running atau pausing saat boot; menunggu evaluasi Orchestrator
 blocked            menunggu child task atau dependency saat berjalan
 awaiting_approval  menunggu keputusan human
 completed          selesai (terminal)
@@ -428,8 +448,12 @@ Transisi yang diizinkan (selain ini ditolak):
 | `running` | `pausing` | klik pause saat LLM/tool call masih in-flight | `task.paused` |
 | `pausing` | `paused` | call in-flight selesai/di-settle | `task.paused` |
 | `pausing` | `running` | pause dibatalkan sebelum settle | `task.resumed` |
+| `pausing` | `interrupted` | proses restart saat call in-flight hilang (startup recovery) | `task.interrupted` |
+| `pausing` | `failed` | call in-flight selesai dengan error fatal | `task.failed` |
+| `pausing` | `cancelled` | dibatalkan | `task.cancelled` |
 | `paused` | `running` | klik resume di UI atau command tag `#TASK-xxx resume` | `task.resumed` |
 | `paused` | `cancelled` | dibatalkan atau TTL paused habis | `task.cancelled` |
+| `running` | `interrupted` | startup recovery saat boot | `task.interrupted` |
 | `interrupted` | `running` | resume disetujui Orchestrator (CAS pada status stored) | `task.resumed` |
 | `interrupted` | `ready` | dijadwalkan ulang oleh Orchestrator | `task.retry_scheduled` |
 | `interrupted` | `failed` | tidak dapat dilanjutkan | `task.failed` |
@@ -447,11 +471,13 @@ Transisi yang diizinkan (selain ini ditolak):
 
 Resumption context: saat `paused -> running`, task **tidak dibuat ulang** — `id` tetap sama, budget tracking melanjutkan `budget.used` sebelumnya, dan Context Manager mengambil progress terakhir dari artefak tersimpan di Operational Store (SQLite, #37.1).
 
-**Cooperative pause (`pausing`):** pause tidak memotong LLM/tool call yang sedang in-flight — call dibiarkan settle dulu (usage-nya tetap dicatat), baru status menjadi `paused`. Ini menjaga konsistensi `budget.reserved`/`budget.settled` (I4).
+**Cooperative pause (`pausing`):** pause tidak memotong LLM/tool call yang sedang in-flight — call dibiarkan settle dulu (usage-nya tetap dicatat), baru status menjadi `paused`. Ini menjaga konsistensi `budget.reserved`/`budget.settled` (I4). Permintaan pause dan penyelesaian pause adalah dua fase berbeda pada `task.paused` (`phase: requested` dari `human:user`, `phase: completed` dari `system:orchestrator`). Permintaan tidak langsung mengubah state; Orchestrator memvalidasinya, menyimpan deadline absolut `pause_deadline` di Task/SQLite dan masuk `pausing`. Tanpa call in-flight, penyelesaian langsung menghasilkan `paused`. Event `phase: completed` baru terbit setelah settle. `task.resumed` tidak berasal langsung dari human: backend memvalidasi command resume lalu Orchestrator menerbitkan event.
 
-**Startup recovery (`interrupted`):** saat boot, semua task berstatus `running` di SQLite diubah menjadi `interrupted`. Orchestrator mengevaluasi tiap task — resume, retry ke `ready`, atau `failed` — memakai Optimistic Concurrency Control (CAS pada status stored) agar evaluasi tidak bentrok dengan writer lain.
+**Startup recovery (`interrupted`):** saat boot, semua task berstatus `running` **dan `pausing`** di SQLite diubah menjadi `interrupted`, dan perubahan direkam sebagai event `task.interrupted` dengan `previous_status`. Task yang sudah terminal tidak diubah. Deadline pause tetap dipertahankan. Call tool yang sedang in-flight saat crash dianggap `outcome_unknown` (I16); jalur resume/retry wajib melewati pemeriksaan keamanan retry dan accounting I4. Orchestrator mengevaluasi tiap task — resume, retry ke `ready`, atau `failed` — memakai CAS pada status stored agar tidak bentrok dengan writer lain. Resume tidak mengulang mutasi yang belum diketahui hasilnya.
 
-**Paused TTL:** task `paused` membawa TTL; habis masa berlaku -> `cancelled`. Ini mencegah task jeda menahan worktree (#60.1) dan alokasi `budget.reserved` selamanya.
+**Paused TTL:** deadline absolut berlaku bagi `pausing`, `paused`, dan `interrupted` yang masih membawa permintaan pause. Setelah deadline lewat -> `cancelled` via `task.cancelled`, termasuk saat startup. Cancel/TTL tidak membuktikan call in-flight batal atau belum berjalan; accounting dan rekonsiliasi efek tetap wajib. Resume yang sah membatalkan permintaan pause dan menghapus `pause_deadline`.
+
+**Invalidasi kontrak (#17.1):** pada perubahan spec yang dipin, Orchestrator menerbitkan `task.contract_changed` untuk task nonterminal dengan `old_hash` = pin tersimpan dan `new_hash` = hash spec sekarang. Task menjadi `contract_status: stale`; tidak menambah status eksekusi baru. Call in-flight boleh settle, tetapi hasilnya tidak boleh dianggap output kontrak baru. Dispatch/resume, review, approval, dan `task.completed` ditolak selama stale. Gate/review/approval dengan hash lama tidak lagi valid. Runtime re-pin ke spec terbaru dan menjalankan codegen sebelum `contract_status` kembali `current`; review/approval yang diperlukan dijalankan ulang. Event `phase: repinned` merekam pin baru agar replay tidak bergantung pada nilai RAM. Jika spec berubah lagi selama codegen, tetap stale dan ulangi terhadap hash terbaru. Task terminal tidak dibuka kembali; pekerjaan lanjutan memakai task baru.
 
 ## 72A.7 Event Registry
 
@@ -471,8 +497,11 @@ Memperluas daftar event di #11. Setiap `type` punya tepat satu schema payload. E
 | `task.assigned` | `task_assigned` | `system:scheduler` → `agent` |
 | `task.started` | `task_started` | `agent` → `system:orchestrator` |
 | `task.blocked` | `task_blocked` | `agent` → `system:orchestrator` |
-| `task.paused` | `task_paused` | `human` → `system:orchestrator` |
+| `task.paused` | `task_paused` | phase=`requested`: `human:user` → `system:orchestrator`; phase=`completed`: `system:orchestrator` → `topic:all` |
 | `task.resumed` | `task_resumed` | `system:orchestrator` → `agent` |
+| `task.interrupted` | `task_interrupted` | `system:orchestrator` → `topic:all` |
+| `task.rebase_conflict` | `task_rebase_conflict` | `system:orchestrator` → `agent` (owner) |
+| `task.contract_changed` | `task_contract_changed` | `system:orchestrator` → `agent` (owner) |
 | `task.completed` | `task_completed` | `agent` → `system:orchestrator` |
 | `task.failed` | `task_failed` | `system:orchestrator` → `topic:all` |
 | `task.cancelled` | `task_cancelled` | `system:orchestrator` → `topic:all` |
@@ -636,6 +665,73 @@ Agent hanya **meminta**. `budget_request` adalah permintaan, bukan pemberian. Bu
                               { "$ref": "urn:societas:1:common#/$defs/apr_id" } ] }
       }
     }
+  },
+  {
+    "$id": "urn:societas:1:task_paused",
+    "type": "object", "additionalProperties": false,
+    "required": ["phase", "initiated_by", "pause_deadline"],
+    "properties": {
+      "phase": { "enum": ["requested", "completed"],
+                 "description": "requested = command pause dari human; completed = pause settle oleh Orchestrator setelah call in-flight selesai (#40.1)" },
+      "initiated_by": { "const": "human:user" },
+      "reason": { "type": "string", "maxLength": 500 },
+      "in_flight_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id",
+                             "description": "call yang ditunggu settle saat phase=requested (pause kooperatif)" },
+      "pause_deadline": { "$ref": "urn:societas:1:common#/$defs/ts",
+                          "description": "TTL paused, dipersist di SQLite — bukan timer RAM (W02)" }
+    }
+  },
+  {
+    "$id": "urn:societas:1:task_resumed",
+    "type": "object", "additionalProperties": false,
+    "required": ["initiated_by", "from_status"],
+    "properties": {
+      "initiated_by": { "enum": ["human:user", "system:orchestrator"],
+                        "description": "human:user (klik resume) atau system:orchestrator (recovery)" },
+      "reason": { "type": "string", "maxLength": 500 },
+      "from_status": { "enum": ["pausing", "paused", "interrupted"],
+                       "description": "state sebelum resume — dipakai rekonsiliasi call in-flight (W02)" }
+    }
+  },
+  {
+    "$id": "urn:societas:1:task_interrupted",
+    "type": "object", "additionalProperties": false,
+    "required": ["previous_status", "reason"],
+    "properties": {
+      "previous_status": { "enum": ["running", "pausing"] },
+      "reason": { "type": "string", "maxLength": 500 },
+      "in_flight_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id",
+                             "description": "call tool yang hilang saat crash — direkonsiliasi sebelum resume (I16); model call diidentifikasi lewat record reservasi/event terkait" }
+    }
+  },
+  {
+    "$id": "urn:societas:1:task_rebase_conflict",
+    "type": "object", "additionalProperties": false,
+    "required": ["conflict_files", "base_ref"],
+    "properties": {
+      "conflict_files": { "type": "array", "minItems": 1,
+                          "items": { "type": "string", "maxLength": 1024 } },
+      "base_ref": { "type": "string", "maxLength": 128,
+                    "description": "ref base saat rebase dicoba (#60.4)" }
+    }
+  },
+  {
+    "$id": "urn:societas:1:task_contract_changed",
+    "type": "object", "additionalProperties": false,
+    "required": ["phase", "old_hash", "new_hash"],
+    "properties": {
+      "phase": { "enum": ["invalidated", "repinned"] },
+      "old_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
+      "new_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
+      "required_actions": { "type": "array", "minItems": 1, "uniqueItems": true,
+                            "items": { "enum": ["recodegen", "rereview", "reapproval"] } }
+    },
+    "if": { "properties": { "phase": { "const": "invalidated" } }, "required": ["phase"] },
+    "then": {
+      "required": ["required_actions"],
+      "properties": { "required_actions": { "contains": { "const": "recodegen" } } }
+    },
+    "else": { "not": { "required": ["required_actions"] } }
   },
   {
     "$id": "urn:societas:1:task_completed",
@@ -856,6 +952,8 @@ Percakapan antar-agent (#16) tetap ada, tetapi dimediasi Event Bus (I1), dibatas
 
 Memperluas #63. Output besar tidak boleh inline: simpan sebagai artifact dan isi `output_artifact_id`.
 
+Capability tepercaya per tool memiliki dua boolean: `idempotent` dan `operation_key_enforced`, keduanya default `false` bila tidak dikonfigurasi (#21). Ini bukan deklarasi agen atau field payload. `operation_key_enforced: true` hanya sah dengan jaminan penyedia yang diketahui runtime, termasuk periode retensinya. Runtime menyimpan key sebelum dispatch pertama dan memakai key + argumen yang sama pada retry; setelah masa jaminan habis, rekonsiliasi/human diperlukan. Key dibatasi ke provider/principal/operasi yang benar dan tidak boleh dipakai ulang untuk argumen berbeda. Key yang baru ditambahkan sesudah timeout tidak melindungi dispatch pertama.
+
 <!-- schemas:tool -->
 ```json
 [
@@ -867,7 +965,9 @@ Memperluas #63. Output besar tidak boleh inline: simpan sebagai artifact dan isi
       "tool_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id" },
       "tool": { "$ref": "urn:societas:1:common#/$defs/tool_name" },
       "arguments": { "type": "object" },
-      "timeout_ms": { "type": "integer", "minimum": 1 }
+      "timeout_ms": { "type": "integer", "minimum": 1 },
+      "operation_key": { "type": "string", "minLength": 1, "maxLength": 128,
+                         "description": "kunci deduplikasi stabil sejak percobaan pertama; hanya menjamin retry jika provider benar-benar menegakkan deduplikasi (I16)" }
     }
   },
   {
@@ -882,7 +982,8 @@ Memperluas #63. Output besar tidak boleh inline: simpan sebagai artifact dan isi
     "properties": {
       "tool_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id" },
       "status": { "enum": ["ok", "error"] },
-      "output": { "type": ["string", "object"], "maxLength": 16000 },
+      "output": { "type": ["string", "object"], "maxLength": 16000,
+                  "description": "string atau object; seluruh payload harus <=16.000 byte UTF-8 setelah serialisasi 72A.12, termasuk overhead JSON — maxLength saja tidak membatasi object" },
       "output_artifact_id": { "$ref": "urn:societas:1:common#/$defs/art_id" },
       "truncated": { "type": "boolean" },
       "duration_ms": { "type": "integer", "minimum": 0 },
@@ -893,17 +994,23 @@ Memperluas #63. Output besar tidak boleh inline: simpan sebagai artifact dan isi
   },
   {
     "$id": "urn:societas:1:tool_call_failed",
-    "type": "object", "additionalProperties": false, "required": ["tool_call_id", "error"],
+    "type": "object", "additionalProperties": false, "required": ["tool_call_id", "error", "outcome"],
     "properties": {
       "tool_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id" },
       "error": { "$ref": "urn:societas:1:error" },
+      "outcome": { "enum": ["not_started", "outcome_unknown"],
+                   "description": "not_started = tool pasti belum berjalan; outcome_unknown = request mungkin sudah dieksekusi tapi response hilang (I16)" },
       "duration_ms": { "type": "integer", "minimum": 0 }
     }
   }
 ]
 ```
 
-`tool.call_completed` dengan `status: "error"` dipakai untuk tool yang berjalan tetapi mengembalikan hasil gagal secara logis (misalnya exit code non-nol). `tool.call_failed` dipakai ketika tool tidak bisa dijalankan sama sekali (ditolak policy, timeout, runtime error).
+Tiga outcome kegagalan tool, dan konsekuensinya (I16):
+
+- **`completed`** — tool berjalan dan mengembalikan hasil gagal secara logis (exit code non-nol, hasil error) -> `tool.call_completed` dengan `status: "error"`.
+- **`not_started`** — tool pasti belum berjalan (ditolak policy, input invalid, sandbox gagal start) -> `tool.call_failed` `outcome: not_started`. Aman di-retry sesuai katalog 72A.9.
+- **`outcome_unknown`** — request mungkin sudah dieksekusi tapi response hilang (`TOOL_TIMEOUT`, `NETWORK_ERROR`) -> `tool.call_failed` `outcome: outcome_unknown`. **Retry otomatis dilarang** kecuali capability tool tepercaya menyatakan `idempotent` atau provider menegakkan `operation_key` yang sama sejak dispatch pertama. Tanpa jaminan itu: rekonsiliasi atau keputusan human yang menjelaskan risiko duplikasi, bukan retry buta. `error.retryable: true` tidak dapat mengalahkan I16; flag itu hanya kelayakan kandidat retry dan tetap tunduk pada policy/budget. Deduplikasi I7 hanya melindungi event internal, bukan server tool.
 
 ### Artifact, Summary, Review
 
@@ -984,7 +1091,7 @@ Untuk approval yang dipicu budget, human boleh menyertakan `budget_override`. Ha
       "trigger": { "enum": ["policy", "budget"] },
       "risk": { "enum": ["low", "medium", "high"] },
       "bound_hash": { "$ref": "urn:societas:1:common#/$defs/sha256",
-                      "description": "Hash kondisi saat request dibuat (commit SHA / migration hash). Jika berubah selama task diparkir, approval invalid (#40.2)." },
+                      "description": "Digest SHA-256 dari snapshot input yang dilindungi approval, wire format sha256: + 64 hex lowercase. Bukan commit SHA Git mentah. Pembentukan snapshot/canonical encoding per jenis aksi belum dikunci; lihat keputusan desain W03/W04 sebelum mengimplementasikan approval mutatif (#40.2)." },
       "details": { "type": "object" },
       "expires_at": { "$ref": "urn:societas:1:common#/$defs/ts" }
     }
@@ -1031,16 +1138,19 @@ Menggabungkan kategori di #44 dengan kode di 5A.15. Satu kode punya satu kategor
 | `MODEL_UNAVAILABLE` | `MODEL_ERROR` | ya | Retry terbatas atau fallback ke provider/model lain. |
 | `INVALID_OUTPUT` | `INVALID_OUTPUT` | ya | Agent correction, maksimal 2 kali (I10). |
 | `TOOL_INPUT_INVALID` | `INVALID_OUTPUT` | ya | Agent correction dengan pesan error dari tool schema. |
-| `TOOL_FAILED` | `TOOL_ERROR` | tergantung tool | Retry hanya jika tool idempotent. |
-| `TOOL_TIMEOUT` | `TIMEOUT` | ya | Retry terbatas. |
-| `NETWORK_ERROR` | `NETWORK_ERROR` | ya | Retry dengan backoff, terbatas. |
+| `TOOL_FAILED` | `TOOL_ERROR` | tergantung tool | Retry mengikuti outcome dan capability I16; gagal logis yang diketahui bukan alasan mengulang mutasi secara buta. |
+| `TOOL_TIMEOUT` | `TIMEOUT` | tergantung tool | `outcome_unknown` — retry hanya jika tool `idempotent` atau `operation_key` ditegakkan provider (I16); jika tidak, rekonsiliasi atau keputusan human. |
+| `NETWORK_ERROR` | `NETWORK_ERROR` | tergantung operasi | Pada tool: `outcome_unknown` kecuali ada bukti belum dispatch; I16 wajib. Pada model call: ikuti guard dan accounting I4, bukan asumsi call gratis. |
+| `SEARCH_BLOCK_NOT_FOUND` | `TOOL_ERROR` | tidak | Bukan retry runtime — error dikembalikan ke agent; agent wajib membaca ulang file asli sebelum mengirim blok baru (#60.3). |
+| `SEARCH_BLOCK_AMBIGUOUS` | `TOOL_ERROR` | tidak | Blok `SEARCH` cocok di lebih dari satu lokasi — perubahan **tidak diterapkan**; agent harus memperlebar konteks blok (#60.3). |
+| `REBASE_CONFLICT` | `DEPENDENCY_FAILED` | tidak | Diterjemahkan menjadi `task.rebase_conflict` ke Engineer (#60.4); task tetap nonterminal, bukan retry otomatis atau kegagalan dependency terminal. |
 | `DEPENDENCY_FAILED` | `DEPENDENCY_FAILED` | tidak | Task `failed` dengan referensi task yang gagal di `details`. |
 | `SCHEMA_VALIDATION_FAILED` | `INVALID_OUTPUT` | tidak | Pesan ditolak di boundary. Ini bug pengirim, bukan masalah sementara. |
 
 Aturan:
 
 - Kode baru wajib ditambahkan ke tabel ini sebelum dipakai.
-- `retryable: true` hanya berarti **boleh** di-retry. Keputusan akhir tetap di Orchestrator berdasarkan retry budget.
+- `retryable: true` hanya berarti kandidat retry. Keputusan akhir tetap di Orchestrator berdasarkan keamanan efek (I16), policy, dan retry budget.
 - `INVALID_OUTPUT` pada model yang murah boleh memicu model escalation (5A.9) sebelum menghabiskan batas koreksi.
 
 ## 72A.10 Alur Baku
@@ -1099,7 +1209,10 @@ Urutan di bawah ini adalah kontrak perilaku. Urutan event harus sesuai.
                          rejected -> tool.call_failed APPROVAL_REJECTED
 3. tool.call_started
 4. tool.call_completed | tool.call_failed
-5. Output di atas batas inline -> simpan artifact, isi output_artifact_id
+   call_failed dengan outcome=not_started  -> aman, ikuti katalog error
+   call_failed dengan outcome=outcome_unknown -> I16: tidak auto-retry;
+        rekonsiliasi/approval untuk tool non-idempotent tanpa operation_key
+5. Output di atas batas inline (serialized agregat, I5) -> simpan artifact, isi output_artifact_id
 ```
 
 ### Review (Local Compiler Gate, 5A.21)
@@ -1614,6 +1727,7 @@ Payload lengkap untuk langkah-langkah penting:
     "reason": "Run RUN-001 mencapai budget $1.00 sebelum review selesai. Perlu tambahan untuk melanjutkan.",
     "trigger": "budget",
     "risk": "low",
+    "bound_hash": "sha256:9b2e4c7a1f05d38e6c94a2b71e05f38d9a41c6b82e7d3f05a1c9e47b3d8206f5",
     "details": { "suggested_increase_usd": 0.30 }
   }
 }
@@ -1622,6 +1736,10 @@ Payload lengkap untuk langkah-langkah penting:
 ## 72A.12 Validasi, Versioning & Kompatibilitas
 
 **Validasi di dua titik:** saat pengirim mempublikasikan, dan saat Event Bus menerima. Pesan yang gagal validasi **tidak masuk Event Store**. Pesan itu dicatat di dead-letter log beserta alasannya, dan pengirim menerima `SCHEMA_VALIDATION_FAILED`.
+
+**Boundary payload (I5):** sesudah validasi envelope dan payload menurut registry, hitung `len(UTF8(JSON(payload)))` atas JSON compact dengan serialisasi kanonik RFC 8785 (JCS). Field envelope tidak termasuk hitungan ini; seluruh field payload, nested object, array, key, escaping, dan overhead struktur termasuk. Batas tepat sama dengan limit diterima; `limit + 1` ditolak. String multibyte dihitung byte, bukan rune/karakter. Serializer yang tidak dapat merepresentasikan payload dengan aman juga menolak payload. Output besar dipersist sebagai artifact terlebih dahulu, lalu payload berisi referensi + ringkasan yang tetap memenuhi limit. Boundary penerima tidak memotong diam-diam: pelanggaran menghasilkan `SCHEMA_VALIDATION_FAILED` sebelum persistence/delivery. Ini pemeriksaan runtime tambahan, bukan klaim bahwa JSON Schema `maxLength` membatasi object.
+
+**Boundary pause/resume:** `task_id` wajib pada `task.paused`, `task.resumed`, `task.interrupted`, `task.rebase_conflict`, dan `task.contract_changed`. Untuk pause `requested`, sender harus `human:user`, tujuan `system:orchestrator`, dan `initiated_by` sama dengan sender. Untuk pause `completed`, sender harus `system:orchestrator`, tujuan `topic:all`, dan `initiated_by` menunjuk human peminta yang tersimpan. `task.resumed` hanya diterbitkan `system:orchestrator`, ditujukan ke owner task; `from_status` harus cocok dengan state tersimpan. Pemeriksaan envelope/payload/state bersama ini diperlukan karena payload schema saja tidak memvalidasi sender atau state SQLite.
 
 **Versioning:**
 
@@ -1664,6 +1782,10 @@ Kontrak dianggap selesai jika:
 - Tidak ada jalur agent-ke-agent yang melewati Event Bus
 - Konten melebihi batas inline ditolak atau dipindahkan menjadi artifact
 - Replay dari Event Store menghasilkan state task yang sama
+- Pause requested/completed memakai sender/fase yang tepat; task `pausing` pulih menjadi `interrupted`, deadline tidak hilang, dan cancel tidak menganggap side effect pasti batal
+- `contract_status: stale` menolak dispatch/review/approval/completion; re-pin direkam dan task terminal tidak dibuka kembali
+- Tool mutatif yang kehilangan response tidak diulang otomatis tanpa jaminan I16; `operation_key` yang tidak ditegakkan provider bukan jaminan
+- Object nested, agregat beberapa string, dan string UTF-8 multibyte melewati pemeriksaan byte I5 (uji `limit`, `limit + 1`)
 
 ---
 
@@ -1805,7 +1927,7 @@ MVP dianggap selesai jika:
 
 - minimal filesystem
 - shell terbatas
-- git opsional
+- git opsional (**baseline belum dikunci**: bertentangan dengan workflow wajib #60.1/#60.4; keputusan W15 diperlukan sebelum implementasi MVP Engineer)
 
 ### Artifacts
 
@@ -2399,7 +2521,7 @@ Keep the human in control.
 
 # 103. Immediate Development Order
 
-Urutan pertama yang direkomendasikan:
+Urutan pertama yang direkomendasikan (urutan Event Bus terhadap delegation/messaging masih menunggu keputusan W15; jangan memperlakukan daftar ini sebagai urutan dependency yang sudah final):
 
 ```text
 1. Workspace
