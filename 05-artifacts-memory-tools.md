@@ -135,13 +135,28 @@ Retrieval semantik selalu melewati Vector DB dan mengembalikan ID referensi (5A.
 
 Vector DB bekerja berdasarkan kemiripan teks (cosine similarity), **bukan status kebenaran atau recency**. Ia tidak tahu dokumen mana yang sudah basi — `architecture_v1.md` (nullifier 2 status) dan `nullifier_v2.md` (4 status) bisa sama-sama ter-retrieve karena kemiripannya hampir sama, sehingga agen menerima dua fakta kontradiktif dan bisa "ketularan" keputusan lama yang sudah dibatalkan. Semakin tua proyek, makin banyak zombie memory: keputusan dibatalkan, bug log yang sudah di-patch, nama fungsi yang sudah deprecated.
 
-Empat aturan kurasi deterministik di Go + SQLite — tanpa algoritma AI tambahan:
+Lima aturan kurasi deterministik di Go + SQLite — tanpa algoritma AI tambahan:
 
 1. **Filter pintu masuk — jangan embed semua hal.** Keputusan/spec hanya boleh di-embed setelah human approval untuk versi yang terikat, Semantic Rebase `PASS` (#60.4), dan merge receipt resmi ke `main` terkonfirmasi (I19). Approval abstrak atau Git rebase bersih saja tidak cukup. Dokumentasi final harus berasal dari kode yang sudah merge. Chat/debat/transkrip arbitrase, keputusan kandidat belum merge, log error/test gagal, draft, proposal kalah, dan putusan lead yang belum lolos pipeline dilarang di-embed.
 2. **Pola Supersede (tombstone di SQLite).** Tabel `artifacts` memiliki kolom `superseded_by` (ID artifact pengganti). Saat keputusan baru menggantikan yang lama, record lama ditandai — bukan dihapus. Setiap ID hasil retrieval Vector DB wajib di-filter ulang ke SQLite: `superseded_by != NULL -> skip`. Dokumen basi tidak pernah masuk context LLM lagi.
 3. **Time-decay scoring.** Skor akhir retrieval = `vector_similarity x faktor_umur` (mis. dokumen minggu ini x1.0, 3 bulan x0.5), dihitung deterministik di Go — dokumen lama yang kebetulan mirip kalah dari dokumen baru yang relevan.
 4. **Ikat memori ke git commit / path.** Setiap entry memori menyimpan metadata `source_path` (mis. `crates/storage/src/nullifier.rs`) dan commit hash. Background GC mengecek via git: jika file/fungsi sudah dihapus atau di-rename di `main`, memori ditandai `stale` dan dibersihkan dari Vector DB.
 5. **Semantic admission guard.** Sebelum embedding, Go mencocokkan approval ID/hash dan snapshot version, semantic evidence version/checksum, serta merge receipt terkonfirmasi. Ketiganya harus mengikat workspace/run/task, base/candidate commit/tree, recipe/policy, dan decision artifact versions/checksums yang sama. Periksa status/tombstone/freshness di SQLite; saat conflict, inconclusive, approval pending, atau receipt belum direkonsiliasi, simpan artifact di Operational Store/quarantine saja. `task.completed`, ringkasan LLM, atau verdict lead bukan merge receipt dan agent tidak dapat memberi flag `passed` sendiri.
+
+### Penyimpanan Batasan Negatif (Anti-Pattern)
+
+Keputusan atau proposal arsitektur yang didebat lalu ditolak (misal via `decision.md` hasil arbitrase atau penolakan human) **tidak dibuang**. Ringkasan kondisi batasannya diekstraksi ke Vector DB (Cognitive Store) dengan:
+
+- Metadata `cognitive_guardrail: true` — menandai entry sebagai batasan validasi, bukan contoh untuk ditiru
+- Tag `anti-pattern` — membedakan dari best practice yang boleh diikuti
+- Ringkasan fokus pada **alasan penolakan** dan **kondisi yang menyebabkan kegagalan**, bukan implementasi detail yang salah
+
+Contoh anti-pattern yang disimpan:
+- Arsitektur yang menembus adapter boundary (ditolak karena violation)
+- Kontrak API yang tidak versioning (ditolak karena breaking change risk)
+- Pola concurrency yang menyebabkan race condition (ditolak karena deadlock evidence)
+
+Anti-pattern ini tetap di-retrieval saat ada konteks serupa, tetapi **diisolasi secara struktural** di prompt LLM (lihat 5A.4) agar model memperlakukannya sebagai penalti/filter validasi akhir, bukan contoh kode yang harus ditiru.
 
 Prinsip: Vector DB adalah **perpustakaan buku yang sudah lulus kurasi** — bukan tempat sampah. Edisi lama ditarik dari rak saat revisi terbit.
 

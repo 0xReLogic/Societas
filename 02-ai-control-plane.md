@@ -169,6 +169,34 @@ Context dibangun dalam 3 lapisan:
          model thinking = instruksi evaluasi arsitektur mendalam
 ```
 
+### Pencegahan Negation Bleed (Isolasi Struktural XML)
+
+Context Manager dilarang menyajikan memori kegagalan sebagai plain-text biasa yang bercampur dengan best practice. Context Manager wajib memisahkan memori secara tegas menggunakan blok XML saat merakit prompt LLM:
+
+```xml
+<historical_success>
+<!-- Rekomendasi/pola yang berhasil ditiru -->
+- Adapter boundary dipertahankan untuk transport calls
+- Kontrak API menggunakan semantic versioning
+- Pola mutex untuk shared state
+</historical_success>
+
+... (instruksi task, konteks saat ini) ...
+
+<confirmed_blacklist>
+<!-- Batasan penolakan / anti-pattern (cognitive_guardrail: true) -->
+- DILARANG: menembus adapter boundary dengan direct worker call
+- DILARANG: kontrak API tanpa versioning
+- DILARANG: pola concurrency yang menyebabkan race condition
+</confirmed_blacklist>
+```
+
+Struktur ini mengunci mekanisme atensi model agar:
+- Rekomendasi positif ditampilkan di awal prompt sebagai contoh untuk diikuti
+- Batasan negatif diisolasi di bagian paling bawah prompt sebagai penalti/filter validasi akhir
+- Model memperlakukan anti-pattern sebagai constraint, bukan contoh implementasi yang harus ditiru
+- Anti-pattern ditandai dengan metadata `cognitive_guardrail: true` dan tag `anti-pattern` di Vector DB (#19.6)
+
 Agent tidak menerima seluruh workspace.
 
 Context default:
