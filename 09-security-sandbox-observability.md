@@ -127,6 +127,7 @@ Path Jailing (#22.2) tetap berlaku — jail scope diarahkan ke worktree task, bu
 - **Startup Reaper:** saat boot, backend menjalankan `git worktree prune` dan membersihkan orphan worktree yang tidak terikat task aktif di SQLite.
 - **Git subcommand restrictions:** agen dilarang menjalankan destructive command di luar worktree miliknya (mis. `branch -D`, `reset --hard` pada repo utama) — allowlist subcommand git divalidasi Policy Engine per worktree scope.
 - **Shared dependency cache:** dependency manager memakai cache global (pnpm store, Go mod cache) agar disk tidak membengkak karena `node_modules`/deps di tiap worktree.
+- **Log Inactivity Timeout monitoring:** Go Tool Runtime memantau stream output `stdout`/`stderr` dari compiler/test yang berjalan di worktree. Tidak ada batas waktu durasi total karena performa kompilasi bervariasi drastis tergantung hardware. Jika output terminal hening/macet total tanpa log baru selama **5 menit**, proses dianggap mengalami *deadlock* / *infinite loop* dan di-kill dengan `SIGTERM`/`SIGKILL`, mengembalikan error `TOOL_TIMEOUT` ke Orchestrator.
 
 ## 60.3 Edit Mechanism — Search & Replace Block
 

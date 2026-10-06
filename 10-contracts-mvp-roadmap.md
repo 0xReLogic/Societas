@@ -37,6 +37,7 @@ Aturan ini ditegakkan oleh runtime, bukan oleh prompt agent.
 | I17 | Approval mengikat snapshot input berversi melalui `sha256(JCS(snapshot))`. Merge hanya memakai kandidat final sesudah rebase + gate + Semantic Rebase `PASS` + review; semantic conflict/inconclusive memblokir integrasi dan dieskalasi. Perubahan base/kandidat/input terikat membatalkan approval dan evidence terkait. Update target memakai expected-base CAS, bukan merge commit baru sesudah approval. | Policy Engine + Orchestrator + Git executor |
 | I18 | Digest hanya menggabungkan presentasi/klik human, bukan otorisasi. Tiap item high diperiksa dan di-grant terpisah terhadap snapshot-nya; critical tidak pernah masuk digest. Unique key `(workspace_id, run_id, batch_hash, approval_id)` menghasilkan satu durable receipt/outcome per item. Menunggu approval melepaskan worker dan tidak mengeksekusi mutasi lebih awal. | Policy Engine + Approval Center + Orchestrator |
 | I19 | Merge memerlukan semantic evidence `pass` yang terikat base/kandidat yang sama sesudah deterministic gate dan sebelum review/approval. Conflict atau hasil inconclusive memblokir integrasi; arbitrase/refactor mengulang rebase, gate, semantic, review, dan approval. Keputusan/spec baru tidak di-embed sebelum approval, semantic pass, dan merge receipt terkonfirmasi serta direkonsiliasi. | Merge Queue + Reviewer + Memory Curator |
+| I20 | Compiler Gate & Local Toolchain menggunakan **log inactivity timeout** (5 menit tanpa output baru pada `stdout`/`stderr`) untuk mendeteksi deadlock/infinite loop, bukan hard execution timeout durasi total, karena performa kompilasi bervariasi drastis per hardware. Kegagalan build/lint dibatasi maksimal 3 iterasi perbaikan; setelah itu task dibekukan (`status: blocked`) dan dieskalasi ke `escalation_lead` atau manusia. | Tool Runtime + Orchestrator |
 
 ## 72A.2 Identifier & Addressing
 
@@ -149,7 +150,7 @@ Label tampilan bukan nilai wire: `thinking` → tier `strong`; Flash tier adalah
 
 ### Budget
 
-Batas yang boleh diberikan ke workspace, run, task, atau agent. Semua field opsional. Field yang tidak ada berarti "ikut batas parent". Mengacu ke 5A.2, 5A.13, 5A.14, dan 5A.19.
+Batas yang boleh diberikan ke workspace, run, task, atau agent. Semua field opsional. Field yang tidak ada berarti "ikut batas parent". Mengacu ke 5A.2, 5A.13, 5A.14, dan 5A.19. Batas koreksi lokal pada Compiler Gate (maksimal 3 iterasi, I20) juga mengikuti prinsip retry budget.
 
 <!-- schema:budget -->
 ```json
@@ -1596,7 +1597,7 @@ Menggabungkan kategori di #44 dengan kode di 5A.15. Satu kode punya satu kategor
 | `INVALID_OUTPUT` | `INVALID_OUTPUT` | ya | Agent correction, maksimal 2 kali (I10). |
 | `TOOL_INPUT_INVALID` | `INVALID_OUTPUT` | ya | Agent correction dengan pesan error dari tool schema. |
 | `TOOL_FAILED` | `TOOL_ERROR` | tergantung tool | Retry mengikuti outcome dan capability I16; gagal logis yang diketahui bukan alasan mengulang mutasi secara buta. |
-| `TOOL_TIMEOUT` | `TIMEOUT` | tergantung tool | `outcome_unknown` — retry hanya jika tool `idempotent` atau `operation_key` ditegakkan provider (I16); jika tidak, rekonsiliasi atau keputusan human. |
+| `TOOL_TIMEOUT` | `TIMEOUT` | tergantung tool | `outcome_unknown` — retry hanya jika tool `idempotent` atau `operation_key` ditegakkan provider (I16); jika tidak, rekonsiliasi atau keputusan human. Untuk compiler/test di Local Toolchain (5A.21, 60.2), timeout menggunakan **log inactivity monitoring** (5 menit tanpa output baru) karena performa kompilasi bervariasi drastis per hardware; bukan hard execution timeout durasi total. |
 | `NETWORK_ERROR` | `NETWORK_ERROR` | tergantung operasi | Pada tool: `outcome_unknown` kecuali ada bukti belum dispatch; I16 wajib. Pada model call: ikuti guard dan accounting I4, bukan asumsi call gratis. |
 | `SEARCH_BLOCK_NOT_FOUND` | `TOOL_ERROR` | tidak | Bukan retry runtime — error dikembalikan ke agent; agent wajib membaca ulang file asli sebelum mengirim blok baru (#60.3). |
 | `SEARCH_BLOCK_AMBIGUOUS` | `TOOL_ERROR` | tidak | Blok `SEARCH` cocok di lebih dari satu lokasi — perubahan **tidak diterapkan**; agent harus memperlebar konteks blok (#60.3). |

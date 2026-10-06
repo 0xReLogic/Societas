@@ -437,6 +437,8 @@ Jangan menggunakan unlimited retry.
 
 Untuk tool, timeout/network error tidak membuktikan side effect belum terjadi. Orchestrator memeriksa `outcome` dan capability tepercaya (#21) sebelum retry: `outcome_unknown` hanya aman untuk retry otomatis bila idempotent atau provider menegakkan `operation_key` stabil sejak dispatch pertama. Tanpa itu, wajib rekonsiliasi/keputusan human (72A.1 I16, 72A.8–10), walaupun retry budget masih tersedia.
 
+**Batas koreksi lokal (Compiler Gate):** kegagalan build/lint pada Deterministic Toolchain Runner (5A.21) dibatasi maksimal **3 kali iterasi perbaikan**. Jika setelah 3 kali percobaan berturut-turut masih gagal/timeout (termasuk log inactivity timeout), Orchestrator membekukan task (`status: blocked`) dan mengeskalasikannya ke `escalation_lead` atau manusia.
+
 ## 5A.14 Fan-Out Limit
 
 Agent tidak boleh membuat agent/task tanpa batas.
@@ -639,7 +641,8 @@ Aturan runner:
   - Go: `golangci-lint run --out-format json`
 - Go menyaring span penting (file, baris, error message) dan hanya mengirim **JSON ringkas <500 karakter** ke Engineer Agent.
 - **Fail-Fast:** pipeline berhenti seketika di step pertama yang gagal (misal gagal `fmt`/`check` → `test` tidak dijalankan). Pipeline dideklarasikan di `workspace.yaml` (`toolchain`, #36).
-- Loop budget: bolak-balik perbaikan lokal dibatasi **maksimal 3 iterasi** — setelah itu gagal permanen atau dieskalasi (lihat 5A.19). Konteks error wajib di-truncate agar tidak terjadi akumulasi token kuadratik antar-iterasi.
+- **Log Inactivity Timeout (5 menit):** Tolak batas waktu durasi total (*hard execution timeout*) karena performa kompilasi bervariasi drastis tergantung hardware (misal CPU 2 core vs 16 core pada build Rust/C++). Go Tool Runtime memantau stream output `stdout`/`stderr`. Selama compiler/test (`cargo`, `go test`, `npm`) masih memproduksi log baru, proses dibiarkan berjalan. Jika output terminal hening/macet total tanpa log baru selama **5 menit**, proses dianggap mengalami *deadlock* / *infinite loop*. Tool Runtime Go langsung mengirim sinyal `SIGTERM`/`SIGKILL` dan mengembalikan error `TOOL_TIMEOUT`.
+- **Loop budget & eskalasi:** bolak-balik perbaikan lokal dibatasi **maksimal 3 iterasi** — setelah itu Orchestrator membekukan task (`status: blocked`) dan mengeskalasikannya ke `escalation_lead` atau manusia (lihat 5A.13 retry budget). Konteks error wajib di-truncate agar tidak terjadi akumulasi token kuadratik antar-iterasi.
 
 ### Expensive Path
 
