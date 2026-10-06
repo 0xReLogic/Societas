@@ -34,6 +34,7 @@ Aturan ini ditegakkan oleh runtime, bukan oleh prompt agent.
 | I14 | Agent tidak dapat mengubah budget, policy, atau limit miliknya sendiri. Hanya human (lewat approval) yang dapat menaikkannya. | Budget Manager + Policy Engine |
 | I15 | Event wajib ter-commit ke Event Store (SQLite) **sebelum** disalurkan ke subscriber (transactional outbox, #42.1). Tidak ada delivery dari memory saja. | Event Bus + Event Store |
 | I16 | Retry tool yang mungkin sudah berjalan hanya boleh jika tool dinyatakan `idempotent` di capability tepercaya (#21) atau request membawa `operation_key` stabil yang deduplikasinya ditegakkan provider tool. Kegagalan dengan hasil tidak diketahui (`outcome_unknown`) pada tool non-idempotent wajib rekonsiliasi atau keputusan human — tidak auto-retry. | Tool Runtime + Policy Engine |
+| I17 | Approval mengikat snapshot input berversi melalui `sha256(JCS(snapshot))`. Merge hanya memakai kandidat final sesudah rebase + gate + review; perubahan base/kandidat/input terikat membatalkan approval dan evidence terkait. Update target memakai expected-base CAS, bukan merge commit baru sesudah approval. | Policy Engine + Orchestrator + Git executor |
 
 ## 72A.2 Identifier & Addressing
 
@@ -374,7 +375,10 @@ Yang dikirim antar-agent adalah referensi, bukan isi (5A.6). Memperluas #17.
     "source_path": { "type": "string", "maxLength": 1024,
                      "description": "path file repo sumber memori (#19.6)" },
     "source_commit": { "type": "string", "maxLength": 64 },
-    "metadata": { "type": "object" }
+    "metadata": {
+      "type": "object",
+      "properties": { "merge_evidence": { "$ref": "urn:societas:1:merge_evidence" } }
+    }
   }
 }
 ```
@@ -466,6 +470,7 @@ Transisi yang diizinkan (selain ini ditolak):
 | `blocked` | `failed` | yang ditunggu gagal | `task.failed` |
 | `blocked` | `cancelled` | dibatalkan | `task.cancelled` |
 | `awaiting_approval` | `ready` | approval granted + `bound_hash` valid; CAS lalu reschedule (#40.1, #40.2) | `approval.granted` |
+| `awaiting_approval` | `ready` | approval invalidated; reschedule untuk refresh input/evidence, bukan izin eksekusi | `approval.invalidated` |
 | `awaiting_approval` | `failed` | rejected atau timeout | `task.failed` |
 | `awaiting_approval` | `cancelled` | dibatalkan | `task.cancelled` |
 
@@ -478,6 +483,8 @@ Resumption context: saat `paused -> running`, task **tidak dibuat ulang** — `i
 **Paused TTL:** deadline absolut berlaku bagi `pausing`, `paused`, dan `interrupted` yang masih membawa permintaan pause. Setelah deadline lewat -> `cancelled` via `task.cancelled`, termasuk saat startup. Cancel/TTL tidak membuktikan call in-flight batal atau belum berjalan; accounting dan rekonsiliasi efek tetap wajib. Resume yang sah membatalkan permintaan pause dan menghapus `pause_deadline`.
 
 **Invalidasi kontrak (#17.1):** pada perubahan spec yang dipin, Orchestrator menerbitkan `task.contract_changed` untuk task nonterminal dengan `old_hash` = pin tersimpan dan `new_hash` = hash spec sekarang. Task menjadi `contract_status: stale`; tidak menambah status eksekusi baru. Call in-flight boleh settle, tetapi hasilnya tidak boleh dianggap output kontrak baru. Dispatch/resume, review, approval, dan `task.completed` ditolak selama stale. Gate/review/approval dengan hash lama tidak lagi valid. Runtime re-pin ke spec terbaru dan menjalankan codegen sebelum `contract_status` kembali `current`; review/approval yang diperlukan dijalankan ulang. Event `phase: repinned` merekam pin baru agar replay tidak bergantung pada nilai RAM. Jika spec berubah lagi selama codegen, tetap stale dan ulangi terhadap hash terbaru. Task terminal tidak dibuka kembali; pekerjaan lanjutan memakai task baru.
+
+**Invalidasi approval:** `approval.invalidated` menutup request/grant lama di record approval SQLite tanpa menghapus event historis. ID approval tidak boleh di-rebind. Task yang diparkir dapat kembali `ready` untuk membangun input/evidence baru; event ini bukan grant dan tidak mengizinkan mutasi. Grant terlambat pada ID yang invalidated ditolak. Task terminal tidak dibuka kembali; perubahan sesudah aksi yang sudah terkonfirmasi bukan invalidasi retroaktif/rollback.
 
 ## 72A.7 Event Registry
 
@@ -530,6 +537,7 @@ Memperluas daftar event di #11. Setiap `type` punya tepat satu schema payload. E
 | `approval.requested` | `approval_requested` | `system:policy` → `human` |
 | `approval.granted` | `approval_granted` | `human` → `system:policy` |
 | `approval.rejected` | `approval_rejected` | `human` → `system:policy` |
+| `approval.invalidated` | `approval_invalidated` | `system:orchestrator` → `human:user` |
 
 ## 72A.8 Payload Schemas
 
@@ -1040,7 +1048,8 @@ Tiga outcome kegagalan tool, dan konsekuensinya (I16):
     "type": "object", "additionalProperties": false, "required": ["artifact_ids"],
     "properties": {
       "artifact_ids": { "type": "array", "minItems": 1, "items": { "$ref": "urn:societas:1:common#/$defs/art_id" } },
-      "criteria": { "type": "array", "items": { "type": "string", "maxLength": 300 } }
+      "criteria": { "type": "array", "items": { "type": "string", "maxLength": 300 } },
+      "merge_binding": { "$ref": "urn:societas:1:approval_snapshot#/$defs/merge_binding" }
     }
   },
   {
@@ -1058,7 +1067,8 @@ Tiga outcome kegagalan tool, dan konsekuensinya (I16):
           }
         }
       },
-      "artifact_id": { "$ref": "urn:societas:1:common#/$defs/art_id" }
+      "artifact_id": { "$ref": "urn:societas:1:common#/$defs/art_id" },
+      "merge_binding": { "$ref": "urn:societas:1:approval_snapshot#/$defs/merge_binding" }
     }
   }
 ]
@@ -1077,21 +1087,177 @@ Memperluas #23 dan 5A.20. Pilihan human dipetakan ke `scope`:
 
 Untuk approval yang dipicu budget, human boleh menyertakan `budget_override`. Hanya jalur ini yang dapat menaikkan budget (I14).
 
+### Snapshot Input Approval (I17)
+
+Snapshot disusun runtime tepercaya, bukan teks keputusan agen. `action` adalah identifier mesin; `reason`/`details` pada request hanya tampilan dan tidak dapat menggantikan input snapshot.
+
+<!-- schemas:approval_binding -->
+```json
+[
+  {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "urn:societas:1:approval_snapshot",
+    "type": "object", "additionalProperties": false,
+    "required": ["snapshot_version", "workspace_id", "run_id", "task_id", "action",
+                 "policy_hash", "contract_hash", "inputs"],
+    "properties": {
+      "snapshot_version": { "const": "approval-snapshot/1" },
+      "workspace_id": { "$ref": "urn:societas:1:envelope#/properties/workspace_id" },
+      "run_id": { "$ref": "urn:societas:1:common#/$defs/run_id" },
+      "task_id": { "oneOf": [
+        { "$ref": "urn:societas:1:common#/$defs/task_id" }, { "type": "null" }
+      ] },
+      "action": { "enum": ["git.merge", "tool.execute", "budget.increase"] },
+      "policy_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
+      "contract_hash": { "$ref": "#/$defs/nullable_hash" },
+      "inputs": { "type": "object" }
+    },
+    "allOf": [
+      {
+        "if": { "properties": { "action": { "const": "git.merge" } }, "required": ["action"] },
+        "then": { "properties": {
+          "task_id": { "$ref": "urn:societas:1:common#/$defs/task_id" },
+          "inputs": { "$ref": "#/$defs/merge_inputs" }
+        } }
+      },
+      {
+        "if": { "properties": { "action": { "const": "tool.execute" } }, "required": ["action"] },
+        "then": { "properties": {
+          "task_id": { "$ref": "urn:societas:1:common#/$defs/task_id" },
+          "inputs": { "$ref": "#/$defs/tool_inputs" }
+        } }
+      },
+      {
+        "if": { "properties": { "action": { "const": "budget.increase" } }, "required": ["action"] },
+        "then": { "properties": { "inputs": { "$ref": "#/$defs/budget_inputs" } } }
+      }
+    ],
+    "$defs": {
+      "nullable_hash": { "oneOf": [
+        { "$ref": "urn:societas:1:common#/$defs/sha256" }, { "type": "null" }
+      ] },
+      "artifact_version": {
+        "type": "object", "additionalProperties": false,
+        "required": ["artifact_id", "version", "checksum"],
+        "properties": {
+          "artifact_id": { "$ref": "urn:societas:1:common#/$defs/art_id" },
+          "version": { "type": "integer", "minimum": 1 },
+          "checksum": { "$ref": "urn:societas:1:common#/$defs/sha256" }
+        }
+      },
+      "git_oid": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
+      "merge_candidate": {
+        "type": "object", "additionalProperties": false,
+        "required": ["repo_id", "target_ref", "expected_base", "candidate_commit",
+                     "candidate_tree", "gate_recipe_hash"],
+        "properties": {
+          "repo_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "target_ref": { "type": "string", "pattern": "^refs/heads/.+", "maxLength": 256 },
+          "expected_base": { "$ref": "#/$defs/git_oid" },
+          "candidate_commit": { "$ref": "#/$defs/git_oid" },
+          "candidate_tree": { "$ref": "#/$defs/git_oid" },
+          "gate_recipe_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" }
+        }
+      },
+      "merge_binding": {
+        "type": "object", "additionalProperties": false,
+        "required": ["workspace_id", "run_id", "task_id", "policy_hash", "contract_hash", "candidate"],
+        "properties": {
+          "workspace_id": { "$ref": "urn:societas:1:envelope#/properties/workspace_id" },
+          "run_id": { "$ref": "urn:societas:1:common#/$defs/run_id" },
+          "task_id": { "$ref": "urn:societas:1:common#/$defs/task_id" },
+          "policy_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
+          "contract_hash": { "$ref": "#/$defs/nullable_hash" },
+          "candidate": { "$ref": "#/$defs/merge_candidate" }
+        }
+      },
+      "merge_inputs": {
+        "type": "object", "additionalProperties": false,
+        "required": ["candidate", "gate_evidence", "review_evidence"],
+        "properties": {
+          "candidate": { "$ref": "#/$defs/merge_candidate" },
+          "gate_evidence": { "$ref": "#/$defs/artifact_version" },
+          "review_evidence": { "$ref": "#/$defs/artifact_version" }
+        }
+      },
+      "tool_inputs": {
+        "type": "object", "additionalProperties": false,
+        "required": ["tool_call_id", "tool", "arguments", "operation_key", "resources"],
+        "properties": {
+          "tool_call_id": { "$ref": "urn:societas:1:common#/$defs/tc_id" },
+          "tool": { "$ref": "urn:societas:1:common#/$defs/tool_name" },
+          "arguments": { "type": "object" },
+          "operation_key": { "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 }, { "type": "null" }
+          ] },
+          "resources": {
+            "type": "array", "uniqueItems": true,
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["resource_id", "version"],
+              "properties": {
+                "resource_id": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                "version": { "type": "string", "minLength": 1, "maxLength": 256 }
+              }
+            }
+          }
+        }
+      },
+      "budget_inputs": {
+        "type": "object", "additionalProperties": false,
+        "required": ["scope", "target_id", "current_limits", "proposed_limits"],
+        "properties": {
+          "scope": { "$ref": "urn:societas:1:common#/$defs/scope" },
+          "target_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "current_limits": { "$ref": "urn:societas:1:budget" },
+          "proposed_limits": { "$ref": "urn:societas:1:budget", "minProperties": 1 }
+        }
+      }
+    }
+  },
+  {
+    "$id": "urn:societas:1:merge_evidence",
+    "type": "object", "additionalProperties": false,
+    "required": ["kind", "binding", "result"],
+    "properties": {
+      "kind": { "enum": ["gate", "review"] },
+      "binding": { "$ref": "urn:societas:1:approval_snapshot#/$defs/merge_binding" },
+      "result": { "enum": ["pass", "fail", "approve", "request_changes", "reject"] }
+    },
+    "if": { "properties": { "kind": { "const": "gate" } }, "required": ["kind"] },
+    "then": { "properties": { "result": { "enum": ["pass", "fail"] } } },
+    "else": { "properties": { "result": { "enum": ["approve", "request_changes", "reject"] } } }
+  }
+]
+```
+
+**Pembentukan digest:** validasi snapshot terlebih dahulu, lalu `bound_hash = "sha256:" + hex_lower(SHA256(JCS(snapshot)))`. JCS mengikuti RFC 8785, menghasilkan byte UTF-8 tanpa BOM/newline; bukan JSON pretty-print dan bukan checksum commit Git. Tolak duplicate key, NaN/Infinity, string Unicode invalid, serta angka yang tidak dapat direpresentasikan losslessly pada domain IEEE-754 binary64/I-JSON; identifier besar disimpan sebagai string. `null` berbeda dari field hilang, array mempertahankan urutan, Unicode tidak dinormalisasi diam-diam. Hash mencakup **seluruh** snapshot, tidak termasuk envelope event, approval ID, reason, risk, atau details. Risk/detail tampilan wajib berasal dari policy/input tepercaya yang sama; jangan tampilkan aksi berbeda dari snapshot.
+
+**Snapshot artifact:** persist JCS bytes sebagai artifact immutable sebelum `approval.requested`. `snapshot_ref` mengikat ID **dan versi dan checksum**, dengan `snapshot_ref.checksum == bound_hash`. Runtime membaca versi tepat itu, mengecek checksum, parse/validasi snapshot, lalu menghitung digest ulang; tidak memakai “latest version”. Snapshot artifact adalah bukti operasional, tidak otomatis eligible untuk Vector DB (#19.6). Artifact hilang/tampered atau schema/profile tidak dikenal → tidak ada grant/dispatch. Aksi tambahan memerlukan profil snapshot kanonik berversi; tidak boleh memakai object bebas sebagai bypass.
+
+**Input per aksi:**
+- `git.merge`: `repo_id` adalah ID repo konfigurasi tepercaya (bukan path pilihan agen), `target_ref` adalah full local branch ref, `expected_base`/`candidate_commit`/`candidate_tree` adalah full lowercase object ID dengan format repo yang sama. Gate recipe hash mengikat toolchain/config/command yang benar-benar dijalankan. Gate dan review masing-masing menunjuk artifact version/checksum yang memiliki `metadata.merge_evidence` valid; binding-nya sama persis dengan workspace/run/task/policy/contract/candidate snapshot. Hanya gate `pass` dan review `approve` diterima. Evidence ID/versi yang berbeda menghasilkan snapshot/hash berbeda.
+- `tool.execute`: adapter tepercaya menormalisasi argumen (termasuk default dan resource identity) sebelum hash; **argumen hasil normalisasi itulah yang dieksekusi**, tidak dibentuk ulang setelah approval. `resources` memuat seluruh precondition/resource version yang dilindungi aksi; ID harus unik dan diurutkan naik menurut code unit UTF-16 `resource_id` (aturan sort string JCS) sebelum JCS. Tanpa resources, array kosong eksplisit. Adapter menentukan fingerprint/version secara deterministik dan mengecek ulang saat dispatch; tidak boleh menghilangkan resource relevan hanya karena versi sulit diperoleh. Bila precondition tidak bisa dijamin saat mutasi, fail closed. `operation_key` mengikuti I16, null bila tidak berlaku; bukan jaminan retry hanya karena ada di snapshot.
+- `budget.increase`: scope/target mengikat level budget yang diminta, `current_limits` adalah konfigurasi tersimpan pada target saat request dan `proposed_limits` adalah override yang persis disetujui. `budget_override` pada grant, bila disertakan, wajib sama dengan `proposed_limits`; bila tidak disertakan, aksi tetap memakai proposed_limits yang terikat. Perubahan pilihan human membuat request/hash baru. Ini **tidak** menetapkan ledger, lease recovery, finite defaults, atau formula inheritance baru (W05 masih terbuka).
+
+`policy_hash` mengikat versi konfigurasi policy/permission yang berlaku untuk aksi, bukan output teks Jev; perubahan konfigurasi terikat memerlukan evaluasi dan approval ulang. `contract_hash` adalah pin aktif atau null eksplisit bila tidak ada kontrak. Scope/task identity dan policy tetap dicek menurut aturan akses existing; snapshot bukan kredensial dan tidak menyelesaikan desain autentikasi event.
+
 <!-- schemas:approval -->
 ```json
 [
   {
     "$id": "urn:societas:1:approval_requested",
     "type": "object", "additionalProperties": false,
-    "required": ["approval_id", "action", "reason", "trigger", "risk", "bound_hash"],
+    "required": ["approval_id", "action", "reason", "trigger", "risk", "bound_hash", "snapshot_ref"],
     "properties": {
       "approval_id": { "$ref": "urn:societas:1:common#/$defs/apr_id" },
-      "action": { "type": "string", "maxLength": 200 },
+      "action": { "enum": ["git.merge", "tool.execute", "budget.increase"] },
       "reason": { "type": "string", "maxLength": 1000 },
       "trigger": { "enum": ["policy", "budget"] },
       "risk": { "enum": ["low", "medium", "high"] },
       "bound_hash": { "$ref": "urn:societas:1:common#/$defs/sha256",
-                      "description": "Digest SHA-256 dari snapshot input yang dilindungi approval, wire format sha256: + 64 hex lowercase. Bukan commit SHA Git mentah. Pembentukan snapshot/canonical encoding per jenis aksi belum dikunci; lihat keputusan desain W03/W04 sebelum mengimplementasikan approval mutatif (#40.2)." },
+                      "description": "sha256: + hex lowercase SHA-256 atas byte JCS seluruh ApprovalSnapshot, bukan commit SHA Git mentah (I17)." },
+      "snapshot_ref": { "$ref": "urn:societas:1:approval_snapshot#/$defs/artifact_version" },
       "details": { "type": "object" },
       "expires_at": { "$ref": "urn:societas:1:common#/$defs/ts" }
     }
@@ -1099,9 +1265,10 @@ Untuk approval yang dipicu budget, human boleh menyertakan `budget_override`. Ha
   {
     "$id": "urn:societas:1:approval_granted",
     "type": "object", "additionalProperties": false,
-    "required": ["approval_id", "scope", "granted_by"],
+    "required": ["approval_id", "bound_hash", "scope", "granted_by"],
     "properties": {
       "approval_id": { "$ref": "urn:societas:1:common#/$defs/apr_id" },
+      "bound_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
       "scope": { "enum": ["once", "task", "run"] },
       "granted_by": { "$ref": "urn:societas:1:common#/$defs/actor" },
       "budget_override": { "$ref": "urn:societas:1:budget" }
@@ -1115,9 +1282,23 @@ Untuk approval yang dipicu budget, human boleh menyertakan `budget_override`. Ha
       "rejected_by": { "$ref": "urn:societas:1:common#/$defs/actor" },
       "reason": { "type": "string", "maxLength": 1000 }
     }
+  },
+  {
+    "$id": "urn:societas:1:approval_invalidated",
+    "type": "object", "additionalProperties": false,
+    "required": ["approval_id", "bound_hash", "reason"],
+    "properties": {
+      "approval_id": { "$ref": "urn:societas:1:common#/$defs/apr_id" },
+      "bound_hash": { "$ref": "urn:societas:1:common#/$defs/sha256" },
+      "reason": { "enum": ["base_changed", "candidate_changed", "policy_changed",
+                           "contract_changed", "evidence_changed", "input_changed",
+                           "snapshot_unavailable", "expired"] }
+    }
   }
 ]
 ```
+
+**Request/grant binding:** satu `approval_id` mengikat satu snapshot/hash selama hidupnya; ID tidak dapat dipakai ulang untuk snapshot baru. Backend menyimpan binding dalam SQLite sebelum menawarkan pilihan ke human. Grant wajib menggemakan hash request; setelah restart, lookup dilakukan pada ID/hash/artifact version tersimpan, bukan nilai RAM. Pada grant, resume, **dan tepat sebelum dispatch**, runtime membangun ulang input aktual terikat dan membandingkan JCS/digest dengan request serta memeriksa expiry, policy, contract freshness, dan evidence. Mismatch → `approval.invalidated`, tanpa eksekusi; request baru memakai ID baru. Rejection/expiry/invalidation tidak pernah otomatis berubah menjadi approval. `scope` sekali/task/run tidak membebaskan binding ini dan tidak mengotorisasi kandidat baru; predicate reuse/atomic once-consumption lintas aksi tetap keputusan desain terpisah.
 
 ## 72A.9 Error Catalog
 
@@ -1131,6 +1312,7 @@ Menggabungkan kategori di #44 dengan kode di 5A.15. Satu kode punya satu kategor
 | `POLICY_DENIED` | `PERMISSION_DENIED` | tidak | Jangan retry. Agent diberi tahu dan dapat memilih jalur lain. |
 | `APPROVAL_REJECTED` | `PERMISSION_DENIED` | tidak | Task `failed` atau agent mengambil jalur alternatif. |
 | `APPROVAL_TIMEOUT` | `TIMEOUT` | tidak | Task `failed`. Human dapat memulai ulang. |
+| `APPROVAL_BINDING_INVALID` | `PERMISSION_DENIED` | tidak | Tolak grant/dispatch pada ID/hash/input/evidence yang tidak cocok atau invalidated; refresh evidence dan request dengan ID baru, bukan retry aksi lama. |
 | `FANOUT_LIMIT_EXCEEDED` | `LIMIT_ERROR` | tidak | `task.delegate_rejected`. Agent harus menggabungkan pekerjaan. |
 | `MAX_DEPTH_EXCEEDED` | `LIMIT_ERROR` | tidak | `task.delegate_rejected`. |
 | `MAX_ITERATIONS_EXCEEDED` | `LIMIT_ERROR` | tidak | Task `failed`. Run dapat berhenti dengan `max_iterations`. |
@@ -1225,6 +1407,43 @@ Urutan di bawah ini adalah kontrak perilaku. Urutan event harus sesuai.
 4. review_completed (approve | request_changes | reject)
      request_changes -> rebuttal max 2 putaran (#48)
 ```
+
+### Serial Merge: Final Candidate Binding (I17, #60.4)
+
+```text
+1. Ambil base = full OID target_ref dari repo tepercaya.
+2. Rebase branch task ke base; conflict -> task.rebase_conflict -> Engineer.
+3. Sesudah resolve, ulangi rebase/validasi base; regenerate PROJECT_MAP pada kandidat.
+4. Freeze candidate commit + tree; index/worktree input gate bersih dan cocok dengan tree.
+5. Gate build/lint/test pada kandidat tepat itu; persist MergeEvidence kind=gate/result=pass.
+6. review.requested/completed membawa merge_binding yang sama;
+   hanya approve yang menghasilkan MergeEvidence kind=review/result=approve.
+7. Persist snapshot JCS berisi base/kandidat/recipe/policy/contract + kedua evidence refs.
+   approval.requested -> human -> approval.granted dengan ID/hash yang sama.
+8. Tepat sebelum integrasi, ambil hak serial per repo/target, baca ulang input terikat:
+   task masih nonterminal/current, grant tidak invalidated/rejected/expired,
+   base masih expected_base, kandidat/tree/evidence/recipe/policy/contract masih sama.
+9. Verifikasi candidate_commit turunan expected_base dan tree commit cocok.
+   Atomic expected-old update target_ref -> candidate_commit (fast-forward).
+10. Persist hasil integrasi; post-merge PROJECT_MAP regen hanya memverifikasi tree
+    yang disetujui, bukan menambah perubahan tak direview.
+```
+
+Approval menunggu human dengan task parked, **tidak memegang goroutine/lock antrean**. Task lain boleh masuk lebih dulu; saat target maju, approval task yang menunggu menjadi invalid. Engineer tidak mengubah frozen candidate ketika approval masih valid. Edit, cherry-pick, rebase, atau regenerasi code/map yang menghasilkan tree/commit baru wajib membuat kandidat baru dan mengulang gate → review → approval. Evidence lama tidak diwariskan walaupun patch terlihat identik. Tidak ada `git merge`/squash/rebase yang membuat commit baru **sesudah** approval; bila ingin merge commit, commit itu harus sudah menjadi kandidat yang digate/review/disetujui.
+
+Evidence artifact menyimpan JSON `MergeEvidence` sebagai konten; `metadata.merge_evidence` adalah indeks dari konten yang sama, bukan sumber alternatif yang boleh diubah terpisah. Bind seluruh workspace/run/task/policy/contract/candidate; `review.completed` untuk merge wajib membawa `merge_binding` dan `artifact_id`, dengan verdict/evidence yang cocok. Recipe mencakup command/config/toolchain yang menguji candidate tree. Gate berjalan dalam sandbox dari tree immutable (termasuk input tracked/generated yang memengaruhi hasil); perubahan input atau dependensi/toolchain yang terikat mengubah recipe/binding dan membatalkan hasil. Working tree kotor atau input tak dapat dipin → tidak lanjut approval.
+
+**CAS ref:** perbandingan dan update tidak boleh menjadi dua operasi “read lalu merge” yang terpisah. Primitive lokal, bila executor diizinkan policy/sandbox dan target bukan symbolic ref:
+
+```text
+git update-ref --no-deref <target_ref> <candidate_commit> <expected_base>
+```
+
+Argumen berasal dari snapshot tervalidasi, bukan command string agen; `repo_id` resolved dari konfigurasi tepercaya. Validasi full ref melalui Git (schema regex bukan pengganti `check-ref-format`), format OID repo, objek commit/tree, ancestry, dan target branch/direct ref. Serialisasi mencakup pemeriksaan final + operasi ref; expected-old Git tetap wajib untuk writer eksternal yang tidak ikut antrean. CAS gagal → tidak merge, `approval.invalidated` `reason: base_changed`, lalu base baru → rebase → gate → review → request baru. Jangan overwrite target atau retry tanpa expected base.
+
+CAS hanya menjamin atomisitas **Git ref**, bukan transaksi lintas Git + SQLite atau konsistensi checkout/index. Executor wajib menjaga target checkout/materialisasi konsisten tanpa memperluas writable shared metadata; model isolasinya tetap keputusan W14. Bila response update hilang/crash sesudah dispatch, ikuti I16: rekonsiliasi ref dengan durable intent/receipt sebelum retry/rebase; ref yang sudah maju mungkin efek aksi sendiri, bukan alasan mengulang merge. Recovery intent/receipt + state/event/outbox lintas subsistem masih W06, tidak dianggap solved oleh CAS. Sesudah merge, task terminal tidak dibuka kembali; bila pekerjaan integration dipisahkan dari task output yang sudah terminal, gunakan task nonterminal terpisah sesuai keputusan semantik completed yang masih terbuka.
+
+Referensi primitive: [git-update-ref](https://git-scm.com/docs/git-update-ref). Referensi encoding: [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785).
 
 ### Output besar (5A.6, 5A.7)
 
@@ -1707,6 +1926,123 @@ Payload lengkap untuk langkah-langkah penting:
 }
 ```
 
+### Approval Snapshot Test Vectors
+
+OID/ID/policy/recipe di fixture ini sintetis, bukan bukti Git runtime. Konten artifact adalah JCS dari JSON di bawah (tanpa newline); checksum bukan hash Markdown fence. Fixture evidence mengikuti `MergeEvidence`, dan indeks metadata harus identik dengan konten. Snapshot budget memakai `task_id: null` sesuai contoh request run-level.
+
+<!-- fixture:approval_budget -->
+```json
+{
+  "snapshot_version": "approval-snapshot/1",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": null,
+  "action": "budget.increase",
+  "policy_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "contract_hash": null,
+  "inputs": {
+    "scope": "run", "target_id": "RUN-001",
+    "current_limits": { "max_cost_usd": 1.0 },
+    "proposed_limits": { "max_cost_usd": 1.3 }
+  }
+}
+```
+
+<!-- fixture:merge_gate -->
+```json
+{
+  "kind": "gate", "result": "pass",
+  "binding": {
+    "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+    "policy_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "contract_hash": null,
+    "candidate": {
+      "repo_id": "repo_societas", "target_ref": "refs/heads/main",
+      "expected_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+      "gate_recipe_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  }
+}
+```
+
+<!-- fixture:merge_review -->
+```json
+{
+  "kind": "review", "result": "approve",
+  "binding": {
+    "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+    "policy_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "contract_hash": null,
+    "candidate": {
+      "repo_id": "repo_societas", "target_ref": "refs/heads/main",
+      "expected_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+      "gate_recipe_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+  }
+}
+```
+
+<!-- fixture:approval_merge -->
+```json
+{
+  "snapshot_version": "approval-snapshot/1",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+  "action": "git.merge",
+  "policy_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "contract_hash": null,
+  "inputs": {
+    "candidate": {
+      "repo_id": "repo_societas", "target_ref": "refs/heads/main",
+      "expected_base": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+      "gate_recipe_hash": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    },
+    "gate_evidence": {
+      "artifact_id": "art_01J9ZB6W9B4V3CGZKBZ01PDVKP", "version": 1,
+      "checksum": "sha256:6360d5aa3738fa2e377f68fb22f5a3efb04a89cf0e9709362fb3fcdaf5537235"
+    },
+    "review_evidence": {
+      "artifact_id": "art_01J9ZB6W9B4V3CGZKBZ01PDVKQ", "version": 1,
+      "checksum": "sha256:4bfa5c74fe806640f757d7f9c127dfdf56ec5f1fb317224385b22ab2c9424ce0"
+    }
+  }
+}
+```
+
+<!-- fixture:approval_tool -->
+```json
+{
+  "snapshot_version": "approval-snapshot/1",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+  "action": "tool.execute",
+  "policy_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "contract_hash": null,
+  "inputs": {
+    "tool_call_id": "tc_01J9ZB75QCACYADGWFKD86P7W1", "tool": "external.mutate",
+    "arguments": { "path": "src/main.go", "label": "界" },
+    "operation_key": "op_task_001_01",
+    "resources": [{
+      "resource_id": "path:src/main.go",
+      "version": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }]
+  }
+}
+```
+
+<!-- fixture:approval_hash_vectors -->
+```json
+{
+  "approval_budget": "sha256:9db02ed91537c1ca63d6d09f9895d669ec210a1cab9859b9362592553510d8a3",
+  "approval_merge": "sha256:291e34ed9a4f374347caa40dff586c4baa1c5498411c0a3e04206f5d9697f649",
+  "approval_tool": "sha256:3f629ed1fd3cf4042b9bb510a9308626aa87c49ab2388efe590d9e19f877f06e",
+  "merge_gate": "sha256:6360d5aa3738fa2e377f68fb22f5a3efb04a89cf0e9709362fb3fcdaf5537235",
+  "merge_review": "sha256:4bfa5c74fe806640f757d7f9c127dfdf56ec5f1fb317224385b22ab2c9424ce0"
+}
+```
+
 <!-- example:approval.requested -->
 ```json
 {
@@ -1723,12 +2059,76 @@ Payload lengkap untuk langkah-langkah penting:
   "to": "human:user",
   "payload": {
     "approval_id": "apr_01J9ZB6W9B4V3CGZKBZ01PDVKN",
-    "action": "budget.increase:run",
+    "action": "budget.increase",
     "reason": "Run RUN-001 mencapai budget $1.00 sebelum review selesai. Perlu tambahan untuk melanjutkan.",
     "trigger": "budget",
     "risk": "low",
-    "bound_hash": "sha256:9b2e4c7a1f05d38e6c94a2b71e05f38d9a41c6b82e7d3f05a1c9e47b3d8206f5",
+    "bound_hash": "sha256:9db02ed91537c1ca63d6d09f9895d669ec210a1cab9859b9362592553510d8a3",
+    "snapshot_ref": {
+      "artifact_id": "art_01J9ZB6W9B4V3CGZKBZ01PDVKS", "version": 1,
+      "checksum": "sha256:9db02ed91537c1ca63d6d09f9895d669ec210a1cab9859b9362592553510d8a3"
+    },
     "details": { "suggested_increase_usd": 0.30 }
+  }
+}
+```
+
+<!-- example:approval.requested -->
+```json
+{
+  "protocol_version": "societas/1", "schema_version": "1",
+  "id": "evt_01J9ZB9Y4S06VP158SP5K84RF2", "type": "approval.requested",
+  "ts": "2026-10-06T09:30:00Z",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+  "correlation_id": "cor_01J9ZBKGD7AHHWX216KWWYZH2T",
+  "causation_id": "evt_01J9ZBS1VHX1W4W4AGPX1QYFDC",
+  "from": "system:policy", "to": "human:user",
+  "payload": {
+    "approval_id": "apr_01J9ZB6W9B4V3CGZKBZ01PDVKM",
+    "action": "git.merge", "reason": "Gate pass dan Reviewer approve pada kandidat final.",
+    "trigger": "policy", "risk": "medium",
+    "bound_hash": "sha256:291e34ed9a4f374347caa40dff586c4baa1c5498411c0a3e04206f5d9697f649",
+    "snapshot_ref": {
+      "artifact_id": "art_01J9ZB6W9B4V3CGZKBZ01PDVKR", "version": 1,
+      "checksum": "sha256:291e34ed9a4f374347caa40dff586c4baa1c5498411c0a3e04206f5d9697f649"
+    },
+    "expires_at": "2026-10-06T10:30:00Z"
+  }
+}
+```
+
+<!-- example:approval.granted -->
+```json
+{
+  "protocol_version": "societas/1", "schema_version": "1",
+  "id": "evt_01J9ZB9Y4S06VP158SP5K84RF3", "type": "approval.granted",
+  "ts": "2026-10-06T09:31:00Z",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+  "correlation_id": "cor_01J9ZBKGD7AHHWX216KWWYZH2T",
+  "causation_id": "evt_01J9ZB9Y4S06VP158SP5K84RF2",
+  "from": "human:user", "to": "system:policy",
+  "payload": {
+    "approval_id": "apr_01J9ZB6W9B4V3CGZKBZ01PDVKM",
+    "bound_hash": "sha256:291e34ed9a4f374347caa40dff586c4baa1c5498411c0a3e04206f5d9697f649",
+    "scope": "once", "granted_by": "human:user"
+  }
+}
+```
+
+<!-- example:approval.invalidated -->
+```json
+{
+  "protocol_version": "societas/1", "schema_version": "1",
+  "id": "evt_01J9ZB9Y4S06VP158SP5K84RF4", "type": "approval.invalidated",
+  "ts": "2026-10-06T09:32:00Z",
+  "workspace_id": "ws_acme", "run_id": "RUN-001", "task_id": "TASK-001",
+  "correlation_id": "cor_01J9ZBKGD7AHHWX216KWWYZH2T",
+  "causation_id": "evt_01J9ZB9Y4S06VP158SP5K84RF3",
+  "from": "system:orchestrator", "to": "human:user",
+  "payload": {
+    "approval_id": "apr_01J9ZB6W9B4V3CGZKBZ01PDVKM",
+    "bound_hash": "sha256:291e34ed9a4f374347caa40dff586c4baa1c5498411c0a3e04206f5d9697f649",
+    "reason": "base_changed"
   }
 }
 ```
@@ -1740,6 +2140,8 @@ Payload lengkap untuk langkah-langkah penting:
 **Boundary payload (I5):** sesudah validasi envelope dan payload menurut registry, hitung `len(UTF8(JSON(payload)))` atas JSON compact dengan serialisasi kanonik RFC 8785 (JCS). Field envelope tidak termasuk hitungan ini; seluruh field payload, nested object, array, key, escaping, dan overhead struktur termasuk. Batas tepat sama dengan limit diterima; `limit + 1` ditolak. String multibyte dihitung byte, bukan rune/karakter. Serializer yang tidak dapat merepresentasikan payload dengan aman juga menolak payload. Output besar dipersist sebagai artifact terlebih dahulu, lalu payload berisi referensi + ringkasan yang tetap memenuhi limit. Boundary penerima tidak memotong diam-diam: pelanggaran menghasilkan `SCHEMA_VALIDATION_FAILED` sebelum persistence/delivery. Ini pemeriksaan runtime tambahan, bukan klaim bahwa JSON Schema `maxLength` membatasi object.
 
 **Boundary pause/resume:** `task_id` wajib pada `task.paused`, `task.resumed`, `task.interrupted`, `task.rebase_conflict`, dan `task.contract_changed`. Untuk pause `requested`, sender harus `human:user`, tujuan `system:orchestrator`, dan `initiated_by` sama dengan sender. Untuk pause `completed`, sender harus `system:orchestrator`, tujuan `topic:all`, dan `initiated_by` menunjuk human peminta yang tersimpan. `task.resumed` hanya diterbitkan `system:orchestrator`, ditujukan ke owner task; `from_status` harus cocok dengan state tersimpan. Pemeriksaan envelope/payload/state bersama ini diperlukan karena payload schema saja tidak memvalidasi sender atau state SQLite.
+
+**Boundary approval:** schema tidak memeriksa hash/artifact/state sendirian. Pada request: envelope workspace/run/task cocok snapshot (task yang tidak berlaku = null), action cocok snapshot, dan checksum snapshot_ref cocok bound_hash. Pada grant: ID/hash cocok request tersimpan yang masih valid; budget_override, bila ada, persis proposed_limits untuk action budget.increase dan tidak boleh ada pada aksi lain. Pada invalidation: Orchestrator mencatat ID/hash lama yang diikat, bukan hash pengganti. Snapshot/evidence versions, profile, checksum, policy, expiry dan live input dicek ulang sebelum dispatch. Unknown action, lost/tampered snapshot, stale grant atau evidence mismatch menghasilkan `APPROVAL_BINDING_INVALID`; mismatch input terikat menginvalidasi ID lama. General auth principal dan atomisitas consumption tetap keputusan terpisah.
 
 **Versioning:**
 
@@ -1784,8 +2186,14 @@ Kontrak dianggap selesai jika:
 - Replay dari Event Store menghasilkan state task yang sama
 - Pause requested/completed memakai sender/fase yang tepat; task `pausing` pulih menjadi `interrupted`, deadline tidak hilang, dan cancel tidak menganggap side effect pasti batal
 - `contract_status: stale` menolak dispatch/review/approval/completion; re-pin direkam dan task terminal tidak dibuka kembali
+- Approval request/grant divalidasi terhadap ID + snapshot artifact version/checksum; `bound_hash` harus sama dengan SHA-256 byte JCS snapshot, bukan raw Git OID
+- Tool mutation memakai normalized arguments/resource versions yang sama dengan snapshot; perubahan live input/policy/contract/expiry menginvalidasi ID lama sebelum dispatch
+- Merge approval hanya sesudah rebase + gate pass + review approve pada commit/tree/base/recipe/context yang sama; perubahan salah satu input mengulang evidence + approval
+- Dua kandidat dari expected base yang sama tidak dapat keduanya masuk: integrasi kedua gagal expected-base CAS, tanpa overwrite/rebase/commit baru sesudah approval
 - Tool mutatif yang kehilangan response tidak diulang otomatis tanpa jaminan I16; `operation_key` yang tidak ditegakkan provider bukan jaminan
 - Object nested, agregat beberapa string, dan string UTF-8 multibyte melewati pemeriksaan byte I5 (uji `limit`, `limit + 1`)
+- Digest snapshot sama meski urutan key berbeda; perubahan argumen/base/kandidat/evidence/policy/contract mengubah hash. Grant dengan hash lama, snapshot artifact version/checksum salah, dan evidence kandidat lain ditolak
+- Dua kandidat approved atas base yang sama tidak boleh keduanya diterapkan: expected-base CAS kedua gagal, evidence/approval diulang; expiry/perubahan saat parked dicek lagi sebelum dispatch
 
 ---
 

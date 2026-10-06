@@ -116,7 +116,11 @@ Pause kooperatif memakai `task.paused` dengan fase requested/completed (72A.8/72
 
 ## 40.2 Bound Hash Protection
 
-Request approval wajib mengikat `bound_hash`: digest SHA-256 dari snapshot input yang dilindungi, dengan format `sha256:` + 64 hex lowercase (72A.8), **bukan commit SHA Git mentah**. Jika input kode atau konfigurasi yang dilindungi berubah selama task diparkir, approval otomatis **invalid**. Pemilihan komponen snapshot dan encoding kanonik per aksi masih menunggu keputusan W03/W04; aturan ini belum merupakan protokol approval mutatif yang lengkap.
+Request approval mengikat `ApprovalSnapshot` berversi: `bound_hash = "sha256:" + hex_lower(SHA256(JCS(snapshot)))`, RFC 8785 (72A.8/I17), **bukan commit SHA Git mentah**. Snapshot disimpan sebagai artifact immutable dengan ID/versi/checksum tepat; grant menggemakan ID/hash, dan ID tidak pernah di-rebind. Envelope workspace/run/task/action harus cocok snapshot.
+
+Runtime mengecek ulang binding pada grant, resume, dan tepat sebelum dispatch: input aktual, expiry, policy/contract, dan evidence. Perubahan → `approval.invalidated`, request baru memakai ID baru. Refresh task `awaiting_approval -> ready` bukan izin mutasi. Scope once/task/run tidak membebaskan pemeriksaan hash; predicate reuse/once-consumption masih keputusan terpisah.
+
+Untuk merge, snapshot mengikat base, commit/tree kandidat final, recipe gate, dan artifact versi gate/review. Urutan wajib: rebase/resolve → freeze kandidat → gate → review → approval → final recheck + expected-base CAS (#60.4, 72A.10). Jangan membuat commit baru sesudah approval. Lock serial hanya di final check/update, tidak dipegang saat menunggu human. Git-ref CAS tidak menjamin transaksi Git+SQLite; intent/receipt recovery (W06) dan shared metadata isolation (W14) masih perlu keputusan.
 
 ---
 
@@ -288,7 +292,7 @@ Security -------/
 
 Orchestrator harus mengontrol concurrency.
 
-Eksekusi boleh paralel, tapi **merge ke `main` diserialkan**: setiap branch task otomatis di-rebase ke `main` terkini sebelum diajukan approval; conflict dikembalikan ke Engineer untuk resolve (lihat **60.4 Serial Merge Queue**).
+Eksekusi boleh paralel, tapi **merge ke `main` diserialkan**: rebase/resolve → freeze kandidat final → gate → review → approval → final recheck + expected-base CAS (I17, 72A.10, **60.4 Serial Merge Queue**). Conflict dikembalikan ke Engineer; perubahan base/kandidat membatalkan evidence dan approval lama.
 
 ---
 
